@@ -1,4 +1,4 @@
-# DSH_archive_delete —— 手动永久删除已归档的对话
+# dsh-archive-delete —— 手动永久删除已归档的对话
 
 给 DeepSeek Harness（DSH）加一个内核**故意没有**的能力：把已归档的对话从磁盘上真正删掉。
 
@@ -7,6 +7,23 @@
 - 只删该会话自己的东西：**会话日志目录**、**投影缓存记录**，以及**工作区里的归档条目与分组归属**。
 
 > **删除不可撤销。** 没有回收站，没有备份，确认之后文件立刻从磁盘消失。
+
+## 安装
+
+```powershell
+git clone https://github.com/Diliving/dsh-archive-delete.git
+```
+
+然后在 DSH 里让 Agent 装它，或直接调 `plugin_manager` 工具：
+
+```
+plugin_manager  action=install_bundle  target="<克隆下来的绝对路径>"
+```
+
+`install_bundle` 会自己完成三件事：把包装进当前 profile 的 `node_modules`、把 `dsh-archive-delete` 加进 `dsh.profile.bundles`、应用它的 `cordis.patch.yml`。
+**不要手工改 profile 的 `package.json` / `cordis.patch.yml`，也不要在 profile 里跑 pnpm。**
+
+装好后**重启一次 DSH**（Host 与客户端 bundle 都在插件激活时读进内存；`install_bundle` 返回 `application: applied` 不代表新 JS 已加载）。
 
 ---
 
@@ -124,21 +141,11 @@ action="delete", ids=[...], confirm=true, forceActive=true   # 仅当部署方�
 
 ---
 
-## 安装与文件位置
-
-安装方式（在 DSH 里让 Agent 执行，或直接调 `plugin_manager` 工具）：
-
-```
-plugin_manager  action=install_bundle  target=<本仓库的绝对路径>
-```
-
-`install_bundle` 会自己完成三件事——把包装进当前 profile 的 `node_modules`（`link:` 依赖）、把 `dsh-archive-delete` 加进 `dsh.profile.bundles`、应用它的 `cordis.patch.yml`。**不要手工改 profile 的 `package.json` / `cordis.patch.yml`，也不要在 profile 里跑 pnpm。**
-
-装好之后：
+## 安装后的文件位置
 
 | 内容 | 位置 |
 |---|---|
-| 插件源码 | 本仓库目录 |
+| 插件源码 | 克隆下来的仓库目录 |
 | profile 链接 | `$DSH_HOME/profiles/<profile>/node_modules/dsh-archive-delete`（`link:` 依赖） |
 | bundle 声明 | profile `package.json` 的 `dsh.profile.bundles` 里 `dsh-archive-delete` |
 | 离线测试（Host 半） | `node verify-dry-run.mjs`（71 项） |
