@@ -70,7 +70,7 @@ const DEFAULT_LIST_LIMIT = 500
  * route so a verification step can tell the two apart instead of reading stale
  * behaviour as a defect.
  */
-const MODULE_GENERATION = 9
+const MODULE_GENERATION = 10
 
 /**
  * Host services, published by {@link apply} once the inject form has resolved
@@ -1229,6 +1229,8 @@ export {
   listArchived,
   deleteSessionArtifacts,
   setHostServices,
+  planDeletion,
+  validateLeaf,
 }
 
 /** Session ids with a deletion in progress, so two callers cannot both report success. */

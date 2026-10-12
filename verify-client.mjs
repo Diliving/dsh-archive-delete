@@ -536,6 +536,64 @@ const stillDeletable = buttonsWith(refusedOverlay, '永久删除').find((button)
 check('the dialog is not left busy after a refusal', stillDeletable !== undefined && stillDeletable.props.disabled !== true)
 check('a failed delete issued no root API call', forbiddenTouches.length === 0, forbiddenTouches.join(','))
 
+// ── case G2: HTTP 200 carrying a REFUSAL ────────────────────────────────────
+//
+// The defect a real profile hit: the Host answers 200 with
+// `{results:[{deleted:false, reason:...}]}` whenever a gate refuses, and the first
+// version of the confirm handler closed the dialog anyway. The deletion that never
+// happened looked exactly like one that did. This case pins the distinction
+// between "the request succeeded" and "the deletion happened".
+
+console.log('\ncase G2 — a 200 that reports a refusal keeps the dialog and shows the reason')
+windowStub.fetch = async (url) => {
+  if (url.startsWith('/plugins/dsh-archive-delete/preview')) {
+    return { ok: true, status: 200, json: async () => ({ id: SESSION_ID, archived: true, bytes: 1, fileCount: 1 }) }
+  }
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({ results: [{ id: SESSION_ID, deleted: false, reason: '会话未归档；本插件默认只删除已归档的会话' }], deleted: 0 }),
+  }
+}
+openRow()
+await new Promise((resolve) => setTimeout(resolve, 0))
+const g2Tree = renderOverlay()
+const refusalButton = buttonsWith(g2Tree, '永久删除')
+  .find((button) => String(button.props.className).includes('danger'))
+check('the dialog is open for the second refusal case', refusalButton !== undefined)
+// The real ConfirmDialog wraps this call in a busy state and a `.catch`; this
+// harness invokes the prop directly, so it must absorb the rejection the same way
+// rather than letting it escape as an unhandled throw.
+await Promise.resolve()
+  .then(() => refusalButton.props.onClick())
+  .catch(() => {})
+await new Promise((resolve) => setTimeout(resolve, 0))
+const afterRefusal = find(renderOverlay(), (node) => String(node.props.className ?? '').includes('dsa-overlay'))
+check('the dialog stays open when the Host reports deleted:false', afterRefusal !== null)
+check('the Host\u2019s reason is shown to the user',
+  afterRefusal !== null && textOf(afterRefusal).includes('会话未归档'), afterRefusal === null ? '(dialog closed)' : textOf(afterRefusal).slice(0, 200))
+check('the dialog is not left busy after such a refusal',
+  afterRefusal !== null && buttonsWith(afterRefusal, '永久删除')
+    .find((button) => String(button.props.className).includes('danger'))?.props.disabled !== true)
+
+// A success must still close it, so the new rejection arm is not simply "never close".
+windowStub.fetch = async (url) => {
+  if (url.startsWith('/plugins/dsh-archive-delete/preview')) {
+    return { ok: true, status: 200, json: async () => ({ id: SESSION_ID, archived: true, bytes: 1, fileCount: 1 }) }
+  }
+  return { ok: true, status: 200, json: async () => ({ results: [{ id: SESSION_ID, deleted: true }], deleted: 1 }) }
+}
+openRow()
+await new Promise((resolve) => setTimeout(resolve, 0))
+const okButton = buttonsWith(renderOverlay(), '永久删除')
+  .find((button) => String(button.props.className).includes('danger'))
+await Promise.resolve()
+  .then(() => okButton.props.onClick())
+  .catch(() => {})
+await new Promise((resolve) => setTimeout(resolve, 0))
+check('a reported success still closes the dialog',
+  find(renderOverlay(), (node) => String(node.props.className ?? '').includes('dsa-overlay')) === null)
+
 // ── case H: the invariant that broke in the field ───────────────────────────
 
 console.log('\ncase H — the bundle never reaches for a React root API')

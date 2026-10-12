@@ -247,26 +247,44 @@ window.__ModuleLoader__.load({
         },
         /** Open the dialog on a resolved request. */
         open: (sessionId, preview) => publish({ sessionId, preview, busy: false, failure: null }),
-        /** Delete the pending conversation. Resolves with the Host's result. */
+        /**
+         * Delete the pending conversation.
+         *
+         * The store owns the success/failure decision, because it is the only
+         * place that sees the Host's answer. A `200` whose body reports
+         * `deleted: false` is a REFUSAL — the archive gate, a live session, a lock
+         * — and it rejects with that reason instead of resolving. The first version
+         * returned `undefined` for both outcomes, so the refusal had nowhere to go
+         * and the dialog closed as if the deletion had happened.
+         * @returns the Host's result, on success only.
+         */
         async confirm() {
           const request = value
           if (request === null || request.busy) return undefined
           publish({ ...request, busy: true, failure: null })
+          let result
           try {
-            const result = await requestJson(API_DELETE, {
+            result = await requestJson(API_DELETE, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ ids: [request.sessionId] }),
             })
-            publish(null)
-            return result
           } catch (error) {
-            // A refusal keeps the dialog open with its reason: the user asked to
-            // delete something and did not get it, so the failure is theirs to
-            // read and retry, not a toast that disappears.
+            // The request itself failed. Keep the dialog open with its reason: the
+            // user asked to delete something and did not get it, so the failure is
+            // theirs to read and retry, not a toast that disappears.
             publish({ ...request, busy: false, failure: String(error?.message ?? error) })
             return undefined
           }
+          const outcomes = Array.isArray(result?.results) ? result.results : []
+          const refusal = outcomes.find((row) => row !== null && row !== undefined && row.deleted !== true)
+          if (refusal !== undefined) {
+            const reason = typeof refusal.reason === 'string' && refusal.reason !== '' ? refusal.reason : 'Host 没有执行删除'
+            publish({ ...request, busy: false, failure: reason })
+            return undefined
+          }
+          publish(null)
+          return result
         },
         /** Dismiss the dialog, whether by cancel or after a success. */
         settle: () => {
@@ -472,10 +490,11 @@ window.__ModuleLoader__.load({
         t,
         onCancel: () => createDeletionRequests().settle(),
         onConfirm: () => {
-          // A successful deletion also drops the row from the sidebar: the Host
-          // removed the id from the workspace record, and this refresh re-pulls
-          // the session list the sidebar renders from.
-          void createDeletionRequests().confirm().then((result) => {
+          // `confirm()` reports its own success: it clears the request only when the
+          // Host actually deleted something. So this handler only has to refresh the
+          // sidebar afterwards, and a refusal needs no special arm here — the store
+          // leaves the dialog open with the reason.
+          return createDeletionRequests().confirm().then((result) => {
             if (result !== undefined && typeof refresh === 'function') void refresh()
           })
         },
