@@ -1,31 +1,12 @@
-# dsh-archive-delete —— 手动永久删除已归档的对话
+# dsh-archive-delete
 
 给 DeepSeek Harness（DSH）加一个内核**故意没有**的能力：把已归档的对话从磁盘上真正删掉。
 
 - 侧边栏会话 **“...” 菜单**里多一项 **永久删除**（只在已归档的会话上出现）。
 - 顺带给 Agent 一个 `archive_delete` 工具，用于批量清理（同样只认已归档会话）。
-- 只删该会话自己的东西：**会话日志目录**、**投影缓存记录**，以及**工作区里的归档条目与分组归属**。
+- 删除该会话自己的东西：**会话日志目录**、**投影缓存记录**、**工作区里的归档条目与分组归属**。
 
 > **删除不可撤销。** 没有回收站，没有备份，确认之后文件立刻从磁盘消失。
-
-## 安装
-
-```powershell
-git clone https://github.com/Diliving/dsh-archive-delete.git
-```
-
-然后在 DSH 里让 Agent 装它，或直接调 `plugin_manager` 工具：
-
-```
-plugin_manager  action=install_bundle  target="<克隆下来的绝对路径>"
-```
-
-`install_bundle` 会自己完成三件事：把包装进当前 profile 的 `node_modules`、把 `dsh-archive-delete` 加进 `dsh.profile.bundles`、应用它的 `cordis.patch.yml`。
-**不要手工改 profile 的 `package.json` / `cordis.patch.yml`，也不要在 profile 里跑 pnpm。**
-
-装好后**重启一次 DSH**（Host 与客户端 bundle 都在插件激活时读进内存；`install_bundle` 返回 `application: applied` 不代表新 JS 已加载）。
-
----
 
 ## 为什么需要它
 
@@ -39,197 +20,134 @@ DSH 有“归档”，没有“删除”，这不是遗漏而是明确的设计�
 
 所以本插件就是那个“带外后端维护”：它按内核自己的命名规则定位产物，删掉它们，别的一概不碰。
 
----
+## 安装
 
-## 一个会话在磁盘上有什么
-
-以默认部署为准（`$DSH_HOME`，日志后端 = `dsh-session-persistence-jsonl`，zstd 压缩）：
-
-```
-<DSH_HOME>/sessions/<项目键>/<编码后的会话 id>/
-    session.v4.jsonl.zstd      # 当前代际日志（权威存储）
-    session.jsonl.zstd         # v0 代际，历史迁移后保留
-    （未来可能还有别的会话本地文件）
-
-<DSH_HOME>/storages/session_projcache/sessions/<会话 id>.json
-                               # 投影检查点（domain: session_projcache, layout: per-record）
-
-<DSH_HOME>/storages/workspace.json
-                               # global.archivedSessionIds[] 与各 workspace 的 sessionIds[]
+```powershell
+git clone https://github.com/Diliving/dsh-archive-delete.git
 ```
 
-- **项目键**（如 `D:\DSH_work\插件` → `--D-DSH_work-~63D2~4EF6--`）和**会话目录名**都由后端自己的算法决定；本插件把 `projectKey`、`encodeSegment` 两个算法**照搬**过来（见 `index.js` 的注释），因此路径不会猜错。
-- **不删**附件。`attachments/v1/**` 是 SHA-256 内容寻址、**跨会话共享**的，按会话清理就需要全量引用扫描，本插件不做这件事（这也是内核自己的立场）。
-- **工作区记账也清理掉**：归档条目与分组归属都删除。见下节。
-
-### `workspace.json` 怎么被清理（以及为什么不是直接改文件）
-
-删除完文件后，插件通过**注册表自己的 API** 把记账也删掉，而不是去改它的存储文件：
-
-```js
-await workspace.detachSession(id)              // 每个记着它的 workspace 各一次
-await ctx.workspaceRegistry.unarchiveSession(id)  // 清掉归档条目
-```
-
-两个调用都跑在 domain 的**写链**上（`Workspace.mutate` → `table.update`），所以内存表、磁盘、以及每一个读者——包括正在运行的 GUI——看到的都是同一份状态，行会立刻从侧边栏消失，不需要重启。两个调用都是幂等的，而且在会话文件已经消失之后依然安全：`detachSession` 对未被记账的 id 不写盘，`unarchiveSession` 按设计不做存在性探测。
-
-**插件从不直接碰 `workspace.json`。** 绕过那条写链去改注册表自己的 domain 文件，正是它的 `workspace-invariant` 伙伴插件要抓的写入，也会和 GUI 抢同一条链。
-
-归档集合同时是本插件的**安全门禁**：归档让会话停下来并保持停止（`agent/pre-step` 读这个持久集合），所以“正在被写”和“正在被删”不可能同时发生。
-
----
-
-## 安全门禁
-
-删除请求按**固定顺序**通过检查，第一道不过就停在那里：
-
-| 顺序 | 门禁 | 拒绝原因 | 备注 |
-|---|---|---|---|
-| 1 | 会话在 `archivedSessionIds` 里 | “会话未归档；本插件默认只删除已归档的会话” | 唯一对“用户没交出来的会话”失败的闭门 |
-| 2 | 会话不在本进程存活集合里 | “会话仍在本进程中活动，拒绝删除” | 只覆盖**本进程**，见下方限制 |
-| 3 | 会话目录可写、且没有 `session.lock` | “可能仍有写入方，拒绝删除” | Windows 上 `session.lock` 永不出现，见下方限制 |
-| 4 | 至少存在一份产物（或该 id 已归档的记账） | “没有找到该会话的任何磁盘产物” | 已归档 + 磁盘空 = 清理记账，视为成功 |
-| 5 | **删除前重新校验**：叶子仍是真实目录（非链接）、存活集合仍未包含它、日志头里的 id 与请求一致 | “会话目录是符号链接/junction”“会话在删除前变为活动状态”“日志属于另一个会话” | 第 1–4 道都是在更早的时刻做的判断，这一道是临门一脚 |
-| — | 同一 id 已有删除在进行 | “同一个会话已有一次删除正在进行” | 两个调用方同时删不会都报成功 |
-
-「已归档」是第一道也是关键的一道：归档是**持久**的，且 `agent/pre-step` 门禁会读这个集合，所以已归档会话无法被唤醒。
-
-Agent 工具默认**也**受这条约束；只有部署方把设置项 `allowAgentDeleteActive` 打开，模型才有权删未归档会话（还需要它显式传 `forceActive`）。
-
-### 这套门禁做不到什么（据实说明）
-
-- **只覆盖本进程的存活集合。** `liveSet()` 读的是本进程的会话注册表，所以**第二个 DSH 实例**正在使用的会话，在本进程看来“不活跃”。多实例部署下这不是可靠的活跃检测。
-- **Windows 上没有 `session.lock` 可查。** JSONL 后端在 Windows 用的是**命名内核信号量**，不在会话目录里落文件；所以第 3 道门禁在 Windows 上的实际内容只剩“目录可写”。它对 POSIX 才有原本的含义。
-- **不判断附件。** 见下文“已知边界”。
-
-### 写入接口的额外防护
-
-- 只接受**回环地址**的 `Host`（`127.0.0.1` / `localhost` / `[::1]`，允许带端口）——不是回环一律拒绝。这条是必需的：DSH 自己的 web 服务默认绑回环，但配置允许改成 `0.0.0.0`；一旦改掉，任何人都能列举并删除你的已归档会话。
-- 带 `Sec-Fetch-Site` 且不是 `same-origin`/`none` 的请求直接拒绝（浏览器自己写这个头，页面脚本改不了）。
-- 带 `Origin` 的请求，其 host 必须与 `Host` 一致。
-- 写操作必须 `content-type: application/json`。
-- 请求体上限 64 KiB。
-
-> **关于 DNS rebinding，说清楚界限。** 只比较 `Origin` 与 `Host` **挡不住** rebinding：恶意页面若从 `evil.example:19387` 提供，而该域名解析到 `127.0.0.1`，浏览器视为同源，两个头都是 `evil.example:19387`，比较会通过。真正拦住它的是 `Sec-Fetch-Site`（页面无法伪造）和上文的回环 `Host` 白名单。**不带任何 `Origin`/`Sec-Fetch-Site` 的非浏览器客户端（curl、脚本）是被放行的**——它本来就已经能访问回环，这是刻意的取舍，也是这些路由必须留在回环绑定之后的原因。
-
----
-
-## 在界面上怎么用
-
-1. 先把对话**归档**（会话行 “...” → 归档）。这是删除的前置条件。
-2. 在侧边栏找到它（归档会话在“已归档”分组里），点 “...” → **永久删除**。
-3. 弹出确认框，上面写着：会话 id、项目目录、文件数、占用大小、创建时间；下面列出将要执行的操作。
-4. 点 **永久删除**。成功后会话从列表消失，文件从磁盘移除。
-
-确认框支持 `Esc` 取消、点遮罩取消；失败时框不关闭并显示原因。
-
----
-
-## 给 Agent 用
-
-工具 `archive_delete`，两种动作：
+然后在 DSH 里让 Agent 装它，或直接调 `plugin_manager` 工具：
 
 ```
-action="list"                                    # 只读：列出已归档会话及占用
-action="delete", ids=[...], confirm=true         # 真正删除；confirm 必填
-action="delete", ids=[...], confirm=true, forceActive=true   # 仅当部署方开了允许时才生效
+plugin_manager  action=install_bundle  target="<克隆下来的绝对路径>"
 ```
 
-设计上强制两步：先 `list` 拿到 id，再带着 `confirm=true` 删除。工具拒绝未确认的删除请求。
+`install_bundle` 会自己把包装进当前 profile、把 `dsh-archive-delete` 加进 `dsh.profile.bundles`、并应用它的 `cordis.patch.yml`。
+**不要手工改 profile 的 `package.json` / `cordis.patch.yml`，也不要在 profile 里跑 pnpm。**
 
----
+装好后**重启一次 DSH**。Host 与客户端 bundle 都在插件激活时读进内存，`install_bundle` 返回 `application: applied` 不代表新 JS 已加载。
 
-## 设置
+`index.js` 静态导入 `@deepseek-ai/schemastery`，它由 DSH 自己提供（`peerDependencies`），**通常什么都不用装**。只有不经 DSH 裸跑离线测试时才需要它在本地可解析——本仓库不提交 `node_modules`。
 
-设置 → 插件 → 已归档会话删除（或直接改 profile 补丁层里 `dsh-archive-delete` 行的 config）：
+## 怎么用
+
+1. 先把对话**归档**（会话行 “...” → 归档）。归档会停掉它正在跑的工作，这是删除的前置条件。
+2. 在侧边栏 **“已归档”** 分组里找到它，点 “...” → **永久删除**。
+3. 确认框会列出：会话 id、项目目录、文件数、占用大小、创建时间。
+4. 点 **永久删除**；放弃可以按 `Esc`、点遮罩或点“取消”。
+
+**失败时对话框不会关闭**，底部显示原因（例如“会话未归档”“会话仍在本进程中活动”“可能仍有写入方”）。
+
+### 给 Agent 用
+
+```
+action="list"                                                # 只读：列出已归档会话及占用
+action="delete", ids=[...], confirm=true                     # 真正删除；confirm 必填
+action="delete", ids=[...], confirm=true, forceActive=true   # 仅当部署方开了允许才生效
+```
+
+### 设置
+
+设置 → 插件 → 已归档会话删除（或改 profile 补丁层里 `dsh-archive-delete` 行的 config）：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `menuEnabled` | `true` | 是否在会话菜单里显示“永久删除” |
 | `allowAgentDeleteActive` | `false` | 是否允许 Agent 删除**未归档**会话 |
 
-两个字段都是 `.volatile()`，所以在设置页改完立即生效，不需要重启。
+两个字段都是 `.volatile()`，改完立即生效，不需要重启。
 
----
+## 它到底删了什么
 
-## 安装后的文件位置
+以默认部署为准（`$DSH_HOME`，日志后端 `dsh-session-persistence-jsonl`，zstd 压缩）：
 
-| 内容 | 位置 |
-|---|---|
-| 插件源码 | 克隆下来的仓库目录 |
-| profile 链接 | `$DSH_HOME/profiles/<profile>/node_modules/dsh-archive-delete`（`link:` 依赖） |
-| bundle 声明 | profile `package.json` 的 `dsh.profile.bundles` 里 `dsh-archive-delete` |
-| 离线测试（Host 半） | `node verify-dry-run.mjs`（104 项） |
-| 离线测试（客户端半） | `node verify-client.mjs`（45 项） |
-| 安全自检 | `node verify-security.mjs`（45 项） |
-| 全部 | `npm test` |
+```
+<DSH_HOME>/sessions/<项目键>/<编码后的会话 id>/              ← 整个会话目录（含 session*.jsonl.zstd）
+<DSH_HOME>/storages/session_projcache/sessions/<id>.json    ← 投影缓存
+工作区记账（workspace.json 里的条目）                         ← 归档条目 + 该会话的分组归属
+```
 
-三套都完全离线，不碰真实数据：
+- **项目键**（如 `C:\work\demo` → `--C-work-demo--`）与**会话目录名**都用后端自己的算法；本插件把 `projectKey`、`encodeSegment` 照搬过来，所以路径不会猜错。
+- **工作区记账走注册表自己的 API**（`Workspace.detachSession` + `WorkspaceRegistry.unarchiveSession`），跑在 domain 写链上，内存、磁盘与正在运行的 GUI 看到同一份状态，行会立刻消失；**插件从不直接改写 `workspace.json`**。
+- 如果删掉的是该项目目录下的最后一个会话，空出来的项目目录会一并清理。
+- **不删附件**：`attachments/**` 是 SHA-256 内容寻址、跨会话共享的，按会话清理需要全量引用扫描，内核也没有这个能力。
+- **不清理 `%TEMP%\dsh-spill-*`**：那是 `dsh-spill-local` 自己的按龄清扫范围。
 
-- **Host 半**在合成的临时 `DSH_HOME` 上跑真实的删除路径（门禁顺序、记账清理、叶子重校验、并发去重、工具输出的 JSON 契约）。
-- **客户端半**用假的 `window.__ModuleLoader__` 加载**真实的 `client.js`**，点击菜单行并驱动对话框的取消、确认、失败三条路径。
-- **安全自检**把本文档的安全声明变成可复跑断言：无 `eval`/`child_process`、只读文件系统面、路径封闭、回环 `Host` 白名单与 `Sec-Fetch-Site`、响应体不含绝对路径、测试套件在导入插件前钉死 `DSH_HOME`。
+## 安全门禁
 
-安全自检是**声明级**检查（正则 + 结构），行为级证明在 Host 半套件里；两者互相覆盖对方的盲区——比如"门禁顺序"只在行为套件里被证明，而"没有 `eval`"只在自检里被证明。
+删除请求按**固定顺序**通过检查，第一道不过就停在那里：
 
-### 依赖
+| 顺序 | 门禁 | 拒绝原因 |
+|---|---|---|
+| 1 | 会话在 `archivedSessionIds` 里 | “会话未归档；本插件默认只删除已归档的会话” |
+| 2 | 会话不在本进程存活集合里 | “会话仍在本进程中活动，拒绝删除” |
+| 3 | 会话目录可写、且没有 `session.lock` | “可能仍有写入方，拒绝删除” |
+| 4 | 至少有一份产物（或该 id 已归档的记账） | “没有找到该会话的任何磁盘产物” |
+| 5 | **删除前重新校验**：叶子仍是真实目录（非链接）、存活集合仍未包含它、日志头里的 id 与请求一致 | “会话目录是符号链接/junction”“会话在删除前变为活动状态”“日志属于另一个会话” |
+| — | 同一 id 已有删除在进行 | “同一个会话已有一次删除正在进行” |
 
-`index.js` 静态导入 `@deepseek-ai/schemastery`，它由 **DSH 自己提供**（声明在 `peerDependencies`）：
+Agent 工具默认**也**受第 1 道约束；只有部署方打开 `allowAgentDeleteActive`，模型才有权删未归档会话（还需要它显式传 `forceActive`）。
 
-- 内核用它来解析本插件的 `Config` schema（`.volatile()` 需要 ≥ 3.18.4）。经 DSH 的模块加载器运行时，这个导入会从 DSH 安装目录解析，因此**通常什么都不用装**。
-- 只有裸跑 `node verify-dry-run.mjs`（不经 DSH）时才需要它在本地可解析。本仓库**不提交** `node_modules`，所以克隆后如果需要本地跑测试，请自行提供：
+**这套门禁做不到什么（据实说明）：**
 
-  ```powershell
-  # 指向 DSH 安装里的那一份（示例，按实际路径改）
-  New-Item -ItemType Directory -Force -Path node_modules\@deepseek-ai | Out-Null
-  New-Item -ItemType Junction -Path node_modules\@deepseek-ai\schemastery -Target "<DSH>\resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\schemastery"
-  ```
+- **只覆盖本进程的存活集合。** `liveSet()` 读本进程的会话注册表，所以**第二个 DSH 实例**正在使用的会话，在本进程看来“不活跃”。多实例部署下这不是可靠的活跃检测。
+- **Windows 上没有 `session.lock` 可查。** JSONL 后端在 Windows 用命名内核信号量，不在会话目录落文件；第 3 道在 Windows 上实际只剩“目录可写”，对 POSIX 才有原本的含义。
+- **`force` 会跳过第 1 道。** 它有第 5 道兜底（重新校验存活与身份），但默认关闭是对的。
 
-  或者把 `verify-dry-run.mjs` 里对 `plugin.*` 的断言当成“文档”读——两套测试都不会修改真实数据。
+### HTTP 路由与防护
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/plugins/dsh-archive-delete/archived` | 已归档会话列表 + 占用 + `menuEnabled` |
+| `GET` | `/plugins/dsh-archive-delete/preview?id=<id>` | 单个会话的删除预览（确认框用它） |
+| `POST` | `/plugins/dsh-archive-delete/delete` | `{"ids":["..."]}` 执行永久删除 |
+| `GET` | `/plugins/dsh-archive-delete/diagnostic` | 只返回**计数与代号**，不含任何会话 id 或路径 |
+
+- 只接受**回环地址**的 `Host`（`127.0.0.1` / `localhost` / `[::1]`，允许带端口）。DSH 默认绑回环，但配置允许改成 `0.0.0.0`；**一旦改掉，同网络的人就能列举并删除你的已归档会话**。
+- `Sec-Fetch-Site` 不是 `same-origin`/`none` 的请求直接拒绝（浏览器自己写这个头，页面脚本改不了）。
+- 带 `Origin` 的请求，其 host 必须与 `Host` 一致；写操作必须 `content-type: application/json`；请求体上限 64 KiB。
+- 响应体**不回显绝对路径**（`preview` 里保留 `cwd`，因为确认框要显示你认得的项目名）。
+
+> **关于 DNS rebinding 的界限。** 只比较 `Origin` 与 `Host` **挡不住** rebinding：恶意页面若从 `evil.example:19387` 提供、而该域名解析到 `127.0.0.1`，浏览器视为同源，两个头都是 `evil.example:19387`。真正拦住它的是 `Sec-Fetch-Site` 与回环 `Host` 白名单。**不带 `Origin`/`Sec-Fetch-Site` 的非浏览器客户端（curl、脚本）被放行**——它本来就能访问回环，这是刻意取舍，也正是这些路由必须留在回环绑定之后的原因。
+
+## 开发
+
+```powershell
+npm test               # 三套都跑
+npm run test:host      # 104 项：门禁顺序、记账清理、叶子重校验、并发去重、工具输出的 JSON 契约
+npm run test:client    # 50 项：加载真实的 client.js，驱动确认框的取消/确认/拒绝/失败四条路径
+npm run test:security  # 45 项：把本文件的安全声明变成可复跑断言
+```
+
+三套都完全离线，**不碰真实数据**：Host 侧在临时 `DSH_HOME` 上跑真实删除路径，客户端侧用假的 `window.__ModuleLoader__` 加载真实的 `client.js`，安全套件只读源码。
+
+安全套件是**声明级**检查，行为级证明在 Host 套件里（例如“门禁顺序”只在行为套件里被证明，“没有 `eval`”只在自检里被证明）。
 
 ### 改完之后怎么让它生效
 
 | 改了什么 | 需要做什么 | 原因 |
 |---|---|---|
-| `index.js`（Host 半） | **重启 DSH** | Host 钉住已加载的模块代；`install_bundle` 返回 `application: applied` 只代表 bundle 行已启用，**不代表新 JS 已加载**。 |
-| `client.js`（客户端半） | **重启 DSH**（只刷新页面**不够**） | 客户端 bundle 在插件激活时就被读进内存一次（`initialBundleSnapshot`），之后页面加载用的是内存里那份；它的文件监听（`pnpm run dev:web`）在桌面模式下没有运行。 |
-| `Config` 里的设置项 | 不需要重启 | 两个字段都是 `.volatile()`，改完立即生效。 |
-| `verify-*.mjs` | 不需要 | 只有手动运行时才用得到。 |
-
----
-
-## HTTP 路由（浏览器半使用）
-
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| `GET` | `/plugins/dsh-archive-delete/diagnostic` | 只返回**计数与代号**（服务是否解析、归档条数、`menuEnabled`），不含任何会话 id 或路径 |
-| `GET` | `/plugins/dsh-archive-delete/archived` | 已归档会话列表 + 占用 + `menuEnabled` |
-| `GET` | `/plugins/dsh-archive-delete/preview?id=<id>` | 单个会话的删除预览（确认框用它） |
-| `POST` | `/plugins/dsh-archive-delete/delete` | `{"ids":["..."]}` 执行永久删除 |
-
-除了 `diagnostic`，每条路由都校验 `Sec-Fetch-Site`（跨站拒绝）、`Host` 必须是回环地址、以及 `Origin` 与 `Host` 一致；写路由另外强制 `content-type: application/json` 并限制请求体 64 KiB。`diagnostic` 之所以可以不带门禁，是因为它**不返回任何可操作的内容**——这条豁免只在它保持“无内容”时成立，所以它连一个会话 id 都不回显，出错也只回 `internal`，不回堆栈。
-
----
-
-## 手动排查
-
-```powershell
-# 服务是否都解析到了、列表是否正常
-curl.exe -s http://127.0.0.1:19387/plugins/dsh-archive-delete/diagnostic
-
-# 现在能看到哪些已归档会话
-curl.exe -s http://127.0.0.1:19387/plugins/dsh-archive-delete/archived
-```
-
-`diagnostic` 里三个 `*Resolved` 全为 `true` 才说明插件拿到了它需要的服务。若为 `false`，说明该服务不在当前组合里——此时删除会**明确拒绝**，而不会把“拿不到服务”当成“没有会话被归档”。
-
----
+| `index.js`（Host 半） | **重启 DSH** | Host 钉住已加载的模块代；`apply: applied` 不代表新 JS 已加载。 |
+| `client.js`（客户端半） | **重启 DSH** | 客户端 bundle 在插件激活时读进内存一次，刷新页面拉不到新代码。 |
+| `Config` 设置项 | 不需要重启 | 两个字段都是 `.volatile()`。 |
 
 ## 已知边界
 
 - **不可撤销**：没有回收站模式。
-- **不清理附件**：内容寻址、跨会话共享，按会话删需要引用扫描（内核也没有这个能力）。
-- **不清理 `%TEMP%\dsh-spill-*`**：那是 `dsh-spill-local` 自己的按龄清扫范围。
-- **同一个项目目录的最后一个会话被删后**，空的项目目录会被顺手删掉；还有别的会话时保留。
-- **搜索索引**：本机 `dsh-session-query-sqlite` 配置为 `openAt: never`、`:memory:`，磁盘上没有索引文件，所以无需处理。
-- **工作区记账清理失败不会回滚文件删除**：日志与缓存已经删掉，返回结果里会带上具体错误；残留的记账条目不可见且在下一次注册表变更时自愈。
+- **工作区记账清理失败不回滚文件删除**：日志与缓存已经删掉，返回结果里带上具体错误；残留条目不可见且在下一次注册表变更时自愈。
+- **搜索索引**：本机 `dsh-session-query-sqlite` 配置为 `openAt: never`、`:memory:`，磁盘上没有索引文件，无需处理。
+- **文件数与占用是估算**：`listSessionFiles` 不跟随子目录里的符号链接（按文件计数）。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。

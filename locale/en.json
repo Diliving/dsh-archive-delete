@@ -1,4 +1,0 @@
-{
-  "title": "Archived conversation deletion",
-  "description": "Permanently delete an archived conversation from the sidebar Session menu — its log and its projection checkpoint — plus an archive_delete tool for the Agent."
-}

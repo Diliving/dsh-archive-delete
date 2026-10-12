@@ -16,21 +16,18 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
-    "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./package.json": "./package.json"
   },
   "icon": "./icon.svg",
   "files": [
     "index.js",
     "client.js",
     "icon.svg",
-    "locale",
     "cordis.patch.yml",
     "verify-dry-run.mjs",
     "verify-client.mjs",
     "verify-security.mjs",
     "README.md",
-    "MANUAL.md",
     "LICENSE"
   ],
   "scripts": {
