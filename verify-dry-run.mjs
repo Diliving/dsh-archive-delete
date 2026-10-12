@@ -236,6 +236,111 @@ function makeResponse() {
   }
 }
 
+// ── the kernel's tool-output contract, re-implemented ───────────────────────
+//
+// A tool result passes two gates before the model sees it, and this plugin broke
+// on both: `snapshotJsonValue` rejects any object property whose value is
+// `undefined`, and `validateJsonSchemaValue` rejects a value that does not match
+// the tool's own declared schema. Both are re-implemented here so the suite can
+// pin them without a running Harness.
+
+/**
+ * Every path at which a value is `undefined`, the way `snapshotJsonValue` sees
+ * it: an object property or array slot holding `undefined` makes the whole value
+ * non-lossless.
+ * @param value - the candidate tool output.
+ * @returns dotted paths of every `undefined` found.
+ */
+function findUndefined(value, path = '', seen = new Set()) {
+  if (value === undefined) return [path === '' ? '(root)' : path]
+  if (typeof value !== 'object' || value === null || seen.has(value)) return []
+  seen.add(value)
+  const found = []
+  for (const key of Object.keys(value)) {
+    found.push(...findUndefined(value[key], path === '' ? key : `${path}.${key}`, seen))
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => found.push(...findUndefined(item, `${path}[${String(index)}]`, seen)))
+  }
+  return found
+}
+
+/** The keywords the kernel's enforced JSON Schema subset accepts. */
+const SUBSET_KEYWORDS = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const', 'description', 'title', 'default', 'examples'])
+const SIBLING_OF_ONE_OF = ['properties', 'required', 'additionalProperties', 'items', 'enum', 'const']
+
+/**
+ * Check a schema is inside the kernel's subset, mirroring `assertSupportedJsonSchema`.
+ * @param schema - the schema to walk.
+ * @returns violation strings, empty when the schema would be accepted.
+ */
+function checkSchemaSubset(schema, path = 'schema', violations = [], seen = new Set()) {
+  if (typeof schema !== 'object' || schema === null || seen.has(schema)) return violations
+  seen.add(schema)
+  for (const key of Object.keys(schema)) {
+    if (!SUBSET_KEYWORDS.has(key)) violations.push(`${path}.${key} is not in the enforced subset`)
+  }
+  if (Object.hasOwn(schema, 'oneOf')) {
+    if (Object.hasOwn(schema, 'type')) violations.push(`${path} cannot declare both type and oneOf`)
+    for (const key of SIBLING_OF_ONE_OF) {
+      if (Object.hasOwn(schema, key)) violations.push(`${path}.${key} is not supported beside oneOf`)
+    }
+    if (!Array.isArray(schema.oneOf) || schema.oneOf.length < 2) violations.push(`${path}.oneOf must be an array of at least two schemas`)
+    else schema.oneOf.forEach((branch, index) => checkSchemaSubset(branch, `${path}.oneOf[${String(index)}]`, violations, seen))
+  }
+  if (schema.properties !== undefined) {
+    for (const [key, value] of Object.entries(schema.properties)) checkSchemaSubset(value, `${path}.properties.${key}`, violations, seen)
+  }
+  if (schema.items !== undefined) checkSchemaSubset(schema.items, `${path}.items`, violations, seen)
+  return violations
+}
+
+/**
+ * Validate a value against the schema subset, mirroring `validateJsonSchemaValue`.
+ * This is the check that would have caught the tool's second defect: an output
+ * declaring `createdAt: integer` while a row legitimately carried `null`.
+ * @param schema - the declared schema.
+ * @param value - the produced value.
+ * @param path - diagnostic path.
+ * @returns violation strings, empty when the value conforms.
+ */
+function validateAgainstSchema(schema, value, path = 'value') {
+  const violations = []
+  if (Object.hasOwn(schema, 'oneOf')) {
+    const matches = schema.oneOf.filter((branch) => validateAgainstSchema(branch, value, path).length === 0)
+    if (matches.length !== 1) violations.push(`${path} must match exactly one oneOf branch (matched ${String(matches.length)})`)
+    return violations
+  }
+  if (schema.const !== undefined && value !== schema.const) violations.push(`${path} must be ${JSON.stringify(schema.const)}`)
+  if (Array.isArray(schema.enum) && !schema.enum.some((entry) => entry === value)) violations.push(`${path} is not one of the declared values`)
+  const type = schema.type
+  if (type !== undefined) {
+    const actual = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+    const ok = type === actual
+      || (type === 'number' && actual === 'number' && Number.isFinite(value))
+      || (type === 'integer' && actual === 'number' && Number.isInteger(value))
+    if (!ok) return [...violations, `${path} must be ${type}`]
+  }
+  if (type === 'object' || schema.properties !== undefined) {
+    for (const key of schema.required ?? []) {
+      if (!Object.hasOwn(value, key)) violations.push(`${path}.${key} is required`)
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) {
+        if (!Object.hasOwn(schema.properties ?? {}, key)) violations.push(`${path}.${key} is not declared`)
+      }
+    }
+    for (const [key, child] of Object.entries(schema.properties ?? {})) {
+      if (!Object.hasOwn(value, key)) continue
+      violations.push(...validateAgainstSchema(child, value[key], `${path}.${key}`))
+    }
+  }
+  if (type === 'array' && schema.items !== undefined) {
+    value.forEach((item, index) => violations.push(...validateAgainstSchema(schema.items, item, `${path}[${String(index)}]`)))
+  }
+  return violations
+}
+
 // ── case 1: the archive gate ────────────────────────────────────────────────
 
 console.log('\ncase 1 — an unarchived session is refused and untouched')
@@ -545,48 +650,47 @@ console.log('\ncase 9 — the Agent tool answers with lossless JSON, ghosts incl
   const tool = harness.tools.get('archive_delete')
   check('the tool is registered', tool !== undefined)
 
+  // The declared schema must be inside the kernel's enforced subset, and every
+  // real result must satisfy it. Both halves are what a real profile broke on.
+  checkEqual('the output schema is inside the kernel subset', checkSchemaSubset(tool.output.schema), [])
+
   const listing = await tool.execute({ action: 'list' })
   const violations = findUndefined(listing)
   checkEqual('no undefined survives in the listing', violations, [])
+  checkEqual('the listing satisfies its own declared schema', validateAgainstSchema(tool.output.schema, listing), [])
   check('the listing reports both archived ids', listing.total === 2 && listing.rows.length === 2, JSON.stringify(listing))
   const ghostRow = listing.rows.find((row) => row.id === ALREADY_GONE)
   check('a row with nothing on disk still carries explicit nulls',
     ghostRow !== undefined && ghostRow.createdAt === null && ghostRow.cwd === null, JSON.stringify(ghostRow))
+  check('the schema declares those fields nullable, not absent',
+    JSON.stringify(tool.output.schema.properties.rows.items.properties.createdAt) === '{"oneOf":[{"type":"integer"},{"type":"null"}]}'
+    && JSON.stringify(tool.output.schema.properties.rows.items.properties.cwd) === '{"oneOf":[{"type":"string"},{"type":"null"}]}',
+    JSON.stringify(tool.output.schema.properties.rows.items.properties))
 
   const deletion = await tool.execute({ action: 'delete', ids: [GHOST], confirm: true })
   const deleteViolations = findUndefined(deletion)
   checkEqual('no undefined survives in the delete result', deleteViolations, [])
+  checkEqual('the delete result satisfies its own declared schema', validateAgainstSchema(tool.output.schema, deletion), [])
   check('the ghost-free session was deleted', deletion.results[0].deleted === true, JSON.stringify(deletion))
   check('a missing artifact path is an explicit null', deletion.results[0].dir === null || typeof deletion.results[0].dir === 'string', JSON.stringify(deletion.results[0]))
 
   // A refusal is the other shape the tool returns, and it must be JSON-safe too.
   const refused = await tool.execute({ action: 'delete', ids: [ALREADY_GONE], confirm: true })
   checkEqual('no undefined survives in a refusal either', findUndefined(refused), [])
+  checkEqual('the refusal satisfies its own declared schema', validateAgainstSchema(tool.output.schema, refused), [])
   check('the archived-but-empty id is cleared rather than refused', refused.results[0].deleted === true, JSON.stringify(refused))
+
+  // And the validator itself must be able to fail, or none of the above proves
+  // anything: a deliberately dishonest schema is rejected on a conforming value.
+  check('a dishonest schema is detected',
+    validateAgainstSchema({ type: 'object', required: ['createdAt'], properties: { createdAt: { type: 'integer' } } }, { createdAt: null }).length === 1,
+    'the harness validator must reject null where an integer is declared')
+  check('an out-of-subset schema is detected',
+    checkSchemaSubset({ type: 'object', properties: { a: { anyOf: [{ type: 'string' }] } } }).length > 0,
+    'the harness checker must reject keywords outside the kernel subset')
 
   check('the tool rendered a text result', typeof tool.output.render === 'function'
     && Array.isArray(tool.output.render({ action: 'list' }, listing)), 'render must return content blocks')
-}
-
-/**
- * Every path at which a value is `undefined`, the way the kernel's
- * `snapshotJsonValue` sees it: an object property or array slot that holds
- * `undefined` makes the whole value non-lossless.
- * @param value - the candidate tool output.
- * @returns dotted paths of every `undefined` found.
- */
-function findUndefined(value, path = '', seen = new Set()) {
-  if (value === undefined) return [path === '' ? '(root)' : path]
-  if (typeof value !== 'object' || value === null || seen.has(value)) return []
-  seen.add(value)
-  const found = []
-  for (const key of Object.keys(value)) {
-    found.push(...findUndefined(value[key], path === '' ? key : `${path}.${key}`, seen))
-  }
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => found.push(...findUndefined(item, `${path}[${String(index)}]`, seen)))
-  }
-  return found
 }
 
 /** Wait until a route handler's floating promise has written its response. */
@@ -598,7 +702,6 @@ async function settle(response) {
 }
 
 // ── teardown ────────────────────────────────────────────────────────────────
-
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) console.log(`HOME kept for inspection: ${HOME}`)
 else await rm(HOME, { recursive: true, force: true })

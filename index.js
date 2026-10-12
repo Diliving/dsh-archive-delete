@@ -70,7 +70,7 @@ const DEFAULT_LIST_LIMIT = 500
  * route so a verification step can tell the two apart instead of reading stale
  * behaviour as a defect.
  */
-const MODULE_GENERATION = 6
+const MODULE_GENERATION = 7
 
 /**
  * Host services, published by {@link apply} once the inject form has resolved
@@ -973,6 +973,13 @@ export function apply(ctx, config) {
         },
       },
       output: {
+        // The output schema must describe what this tool ACTUALLY returns, and the
+        // kernel validates a result against it before the model sees it. An
+        // archived id with nothing left on disk legitimately has no creation time
+        // and no recorded cwd, so those two are declared nullable rather than
+        // dropped: `oneOf` with a `null` branch is the subset's way to say
+        // "integer, or explicitly nothing". Getting this wrong is not cosmetic —
+        // it fails the whole call, which is exactly what a real profile hit.
         schema: {
           type: 'object',
           additionalProperties: true,
@@ -985,14 +992,17 @@ export function apply(ctx, config) {
               items: {
                 type: 'object',
                 additionalProperties: true,
-                required: ['id'],
+                required: ['id', 'createdAt', 'cwd'],
                 properties: {
                   id: { type: 'string' },
-                  createdAt: { type: 'integer' },
-                  cwd: { type: 'string' },
+                  createdAt: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+                  cwd: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                   bytes: { type: 'integer' },
                   files: { type: 'integer' },
+                  exists: { type: 'boolean' },
                   live: { type: 'boolean' },
+                  lockFile: { type: 'boolean' },
+                  delegationDepth: { type: 'integer' },
                 },
               },
             },
@@ -1001,13 +1011,20 @@ export function apply(ctx, config) {
               items: {
                 type: 'object',
                 additionalProperties: true,
-                required: ['id', 'deleted'],
+                required: ['id', 'deleted', 'reason'],
                 properties: {
                   id: { type: 'string' },
                   deleted: { type: 'boolean' },
-                  reason: { type: 'string' },
+                  reason: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  dir: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  cache: { type: 'string' },
+                  // The number of workspace records actually detached, or one of
+                  // the 'skipped'/'failed' markers — hence a union, not a string.
+                  detach: { oneOf: [{ type: 'integer' }, { type: 'string' }] },
+                  unarchive: { type: 'string' },
                   removedFiles: { type: 'integer' },
                   freedBytes: { type: 'integer' },
+                  errors: { type: 'array', items: { type: 'string' } },
                 },
               },
             },
