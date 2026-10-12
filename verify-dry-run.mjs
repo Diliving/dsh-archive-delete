@@ -153,10 +153,33 @@ function makeApplyHarness({ archived, live }) {
   const routes = new Map()
   const tools = new Map()
   const disposers = []
+  // The registry stub models the APIs the deletion path cleans up through, the
+  // same ones `makeContext` models, so `apply`-driven cases can delete too.
+  const detached = []
+  const unarchived = []
+  const archiveSet = new Set(archived)
+  const tables = []
+  const table = {
+    async delete(key) {
+      const path = join(HOME, 'storages', 'session_projcache', 'sessions', `${plugin.encodeSegment(key)}.json`)
+      if (!existsSync(path)) return false
+      await rm(path, { force: true })
+      return true
+    },
+  }
   const services = {
     sessions: { list: () => live.map((id) => ({ id })) },
-    workspaceRegistry: { archivedSessionIds: [...archived] },
-    storageDomain: { get: () => undefined },
+    workspaceRegistry: {
+      get archivedSessionIds() {
+        return [...archiveSet]
+      },
+      list: () => tables,
+      async unarchiveSession(sessionId) {
+        unarchived.push(sessionId)
+        archiveSet.delete(sessionId)
+      },
+    },
+    storageDomain: { get: (name) => (name === 'session_projcache' ? { table: () => table } : undefined) },
     webServer: {
       register(route) {
         routes.set(route.path, route)
@@ -193,7 +216,7 @@ function makeApplyHarness({ archived, live }) {
     effect,
     ...Object.fromEntries(names.map((name) => [name, services[name]])),
   })
-  return { context, services, routes, tools, pending, disposers, childFor }
+  return { context, services, routes, tools, pending, disposers, childFor, detached, unarchived, tables }
 }
 
 /** A fake `res` that records what a route handler wrote. */
@@ -495,6 +518,75 @@ console.log('\ncase 8 — apply() resolves its services through inject and serve
     toolRefused = true
   }
   check('the tool demands confirm=true', toolRefused)
+}
+
+// ── case 9: the tool's own output must be lossless JSON ─────────────────────
+//
+// This is the defect a real profile produced. A tool result is validated with
+// `snapshotJsonValue`, which rejects an object property whose value is
+// `undefined` — and an archived id with nothing left on disk legitimately has no
+// `createdAt` and no `cwd`. The listing therefore answered
+// "value is not lossless JSON" and the Agent could not delete anything at all.
+// The check below walks the tool's REAL result the way that validator does.
+
+console.log('\ncase 9 — the Agent tool answers with lossless JSON, ghosts included')
+{
+  const GHOST = 'session-99999999-9999-4999-8999-999999999999'
+  const ghostDir = join(HOME, 'sessions', plugin.projectKey(CWD), plugin.encodeSegment(GHOST))
+  await mkdir(ghostDir, { recursive: true })
+  const ghostHeader = JSON.stringify({ type: 'session', version: 4, id: GHOST, createdAt: 1791386038511, cwd: CWD, isSeeded: false, delegationDepth: 0 })
+  await writeFile(join(ghostDir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(`${ghostHeader}\n`)))
+
+  const harness = makeApplyHarness({ archived: [GHOST, ALREADY_GONE], live: [] })
+  plugin.apply(harness.context, { menuEnabled: false, allowAgentDeleteActive: false })
+  for (const entry of harness.pending) {
+    if (entry.names.every((name) => harness.services[name] !== undefined)) entry.callback(harness.childFor(entry.names))
+  }
+  const tool = harness.tools.get('archive_delete')
+  check('the tool is registered', tool !== undefined)
+
+  const listing = await tool.execute({ action: 'list' })
+  const violations = findUndefined(listing)
+  checkEqual('no undefined survives in the listing', violations, [])
+  check('the listing reports both archived ids', listing.total === 2 && listing.rows.length === 2, JSON.stringify(listing))
+  const ghostRow = listing.rows.find((row) => row.id === ALREADY_GONE)
+  check('a row with nothing on disk still carries explicit nulls',
+    ghostRow !== undefined && ghostRow.createdAt === null && ghostRow.cwd === null, JSON.stringify(ghostRow))
+
+  const deletion = await tool.execute({ action: 'delete', ids: [GHOST], confirm: true })
+  const deleteViolations = findUndefined(deletion)
+  checkEqual('no undefined survives in the delete result', deleteViolations, [])
+  check('the ghost-free session was deleted', deletion.results[0].deleted === true, JSON.stringify(deletion))
+  check('a missing artifact path is an explicit null', deletion.results[0].dir === null || typeof deletion.results[0].dir === 'string', JSON.stringify(deletion.results[0]))
+
+  // A refusal is the other shape the tool returns, and it must be JSON-safe too.
+  const refused = await tool.execute({ action: 'delete', ids: [ALREADY_GONE], confirm: true })
+  checkEqual('no undefined survives in a refusal either', findUndefined(refused), [])
+  check('the archived-but-empty id is cleared rather than refused', refused.results[0].deleted === true, JSON.stringify(refused))
+
+  check('the tool rendered a text result', typeof tool.output.render === 'function'
+    && Array.isArray(tool.output.render({ action: 'list' }, listing)), 'render must return content blocks')
+}
+
+/**
+ * Every path at which a value is `undefined`, the way the kernel's
+ * `snapshotJsonValue` sees it: an object property or array slot that holds
+ * `undefined` makes the whole value non-lossless.
+ * @param value - the candidate tool output.
+ * @returns dotted paths of every `undefined` found.
+ */
+function findUndefined(value, path = '', seen = new Set()) {
+  if (value === undefined) return [path === '' ? '(root)' : path]
+  if (typeof value !== 'object' || value === null || seen.has(value)) return []
+  seen.add(value)
+  const found = []
+  for (const key of Object.keys(value)) {
+    found.push(...findUndefined(value[key], path === '' ? key : `${path}.${key}`, seen))
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => found.push(...findUndefined(item, `${path}[${String(index)}]`, seen)))
+  }
+  return found
 }
 
 /** Wait until a route handler's floating promise has written its response. */

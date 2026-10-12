@@ -70,7 +70,7 @@ const DEFAULT_LIST_LIMIT = 500
  * route so a verification step can tell the two apart instead of reading stale
  * behaviour as a defect.
  */
-const MODULE_GENERATION = 5
+const MODULE_GENERATION = 6
 
 /**
  * Host services, published by {@link apply} once the inject form has resolved
@@ -636,6 +636,53 @@ async function deleteSessionArtifacts(ctx, id, options = {}) {
 }
 
 /**
+ * One listing row, normalized to lossless JSON.
+ *
+ * A tool result must be lossless JSON — `undefined` is not a JSON value — and an
+ * archived id with nothing left on disk legitimately has no creation time and no
+ * recorded cwd. Absent fields therefore become `null` rather than `undefined`,
+ * which is also what the tool's declared output schema accepts.
+ * @param id - session id.
+ * @param plan - the deletion plan.
+ * @param live - whether the session is live in this process.
+ * @returns a JSON-safe row.
+ */
+function listingRow(id, plan, live) {
+  return {
+    id,
+    createdAt: typeof plan.createdAt === 'number' ? plan.createdAt : null,
+    cwd: typeof plan.cwd === 'string' ? plan.cwd : null,
+    bytes: plan.bytes + (plan.cachePresent ? plan.cacheBytes : 0),
+    files: plan.files.length,
+    exists: plan.dir !== undefined || plan.cachePresent,
+    live: live.has(id),
+    lockFile: plan.lockFile === true,
+    delegationDepth: plan.delegationDepth,
+  }
+}
+
+/**
+ * A deletion outcome normalized to lossless JSON — the same rule as
+ * {@link listingRow}, applied to the fields that are absent on the happy path.
+ * @param result - the outcome of {@link deleteSessionArtifacts}.
+ * @returns a JSON-safe outcome.
+ */
+function outcomeJson(result) {
+  return {
+    id: result.id,
+    deleted: result.deleted === true,
+    dir: typeof result.dir === 'string' ? result.dir : null,
+    removedFiles: result.removedFiles ?? 0,
+    freedBytes: result.freedBytes ?? 0,
+    cache: result.cache ?? 'skipped',
+    detach: result.detach ?? 'skipped',
+    unarchive: result.unarchive ?? 'skipped',
+    errors: Array.isArray(result.errors) ? result.errors : [],
+    reason: typeof result.reason === 'string' ? result.reason : null,
+  }
+}
+
+/**
  * The archived conversations with the metadata a person needs to recognise one.
  * @param ctx - Host plugin context.
  * @param limit - maximum rows.
@@ -645,20 +692,7 @@ async function listArchived(ctx, limit) {
   const ids = archivedSet()
   const live = liveSet()
   const rows = []
-  for (const id of [...ids].slice(0, limit)) {
-    const plan = await planDeletion(ctx, id)
-    rows.push({
-      id,
-      createdAt: plan.createdAt,
-      cwd: plan.cwd,
-      bytes: plan.bytes + (plan.cachePresent ? plan.cacheBytes : 0),
-      files: plan.files.length,
-      exists: plan.dir !== undefined || plan.cachePresent,
-      live: live.has(id),
-      lockFile: plan.lockFile === true,
-      delegationDepth: plan.delegationDepth,
-    })
-  }
+  for (const id of [...ids].slice(0, limit)) rows.push(listingRow(id, await planDeletion(ctx, id), live))
   rows.sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))
   return { total: ids.size, rows }
 }
@@ -1013,7 +1047,7 @@ export function apply(ctx, config) {
         const settings = currentSettings(config)
         const force = settings.allowAgentDeleteActive && args.forceActive === true
         const results = []
-        for (const id of ids) results.push(await remove(id, { force }))
+        for (const id of ids) results.push(outcomeJson(await remove(id, { force })))
         return { action: 'delete', total: ids.length, results }
       },
     }), `${PLUGIN_ID}: archive_delete tool`)
