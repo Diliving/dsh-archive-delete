@@ -49,25 +49,59 @@ console.log('\nD — the delete gate')
 {
   const order = ['archived', 'live', 'lockFile', 'writable']
   check('all four gate variables exist', order.every((name) => index.includes(name)))
-  check('the archive gate is the FIRST refusal after planning', index.indexOf('!plan.archived && options.force !== true') > 0)
+  // The ORDER itself is not asserted here on purpose. A regex can only prove a
+  // string exists, and the first version of this file pretended otherwise with
+  // `indexOf(...) > 0`, which stays true wherever the gate sits. The order is
+  // proven behaviourally in verify-dry-run.mjs case 4c, by a fixture that trips
+  // four gates at once so exactly one can answer.
+  check('the ordering proof lives in the behavioural suite',
+    readFileSync('verify-dry-run.mjs', 'utf8').includes('case 4c — the refusal order'),
+    'the ordering claim must be backed by a fixture, not a substring')
   check('force cannot be set from the browser route', /remove\(id, \{ force: false \}\)/.test(index))
   check('the agent tool needs the deployment flag AND an explicit argument',
     /settings\.allowAgentDeleteActive && args\.forceActive === true/.test(index))
   check('the tool refuses an unconfirmed delete', /args\.confirm !== true/.test(index))
+  // The `force` path skips the archive gate, so it must be guarded by the
+  // re-validation that runs immediately before removal.
+  check('the destructive call re-validates liveness first', /liveSet\(\)\.has\(id\)[\s\S]{0,120}?会话在删除前变为活动状态/.test(index))
+  check('the destructive call re-validates the leaf first',
+    /const guard = await validateLeaf\(plan\.dir, id\)[\s\S]*?await rm\(plan\.dir/.test(index),
+    'validateLeaf must run before the rm, with only comments allowed in between')
+  check('a leaf that is a link is refused', /info\.isSymbolicLink\(\)\) return '会话目录是符号链接/.test(index))
+  check('a leaf whose log names another session is refused', /header\.id\) !== id\) return '会话目录里的日志属于另一个会话/.test(index))
+  check('concurrent deletes of one id are serialized', /IN_FLIGHT\.has\(id\)/.test(index) && /IN_FLIGHT\.add\(id\)/.test(index))
 }
 
 console.log('\nE — the HTTP surface')
 {
   check('the write route requires a JSON content type', /checkOrigin\(req, true\)/.test(index))
-  // Count the routes instead of hardcoding one: every route that either returns
-  // session data or mutates anything must carry the origin guard.
   const routePaths = [...index.matchAll(/path: `\$\{ROUTE\}\/([a-z]+)`/g)].map((m) => m[1])
-  const guarded = (index.match(/checkOrigin\(req, (?:true|false)\)/g) ?? []).length
   check('every registered route is accounted for', routePaths.length === 4, routePaths.join(', '))
-  check('every route that reads session data or writes is guarded', guarded === 3, `${guarded} guard(s) for ${routePaths.join('/')}`)
-  check('the diagnostic route exposes no session data', /diagnostic[\s\S]{0,600}?steps/.test(index) && !/diagnostic[\s\S]{0,900}?rows/.test(index))
-  check('a mismatched Origin is refused with 403', /Origin 与 Host 不一致/.test(index))
+  check('the diagnostic route is the only one without a guard',
+    (index.match(/checkOrigin\(req, (?:true|false)\)/g) ?? []).length === 3, routePaths.join('/'))
+  // DNS rebinding is the attack the Origin/Host comparison does NOT stop: a
+  // rebound page is same-origin and both headers read the attacker's authority.
+  // `Sec-Fetch-Site` cannot be forged by page script, and the Host allowlist pins
+  // the request to the interface these routes are for.
+  check('cross-site requests are refused by Sec-Fetch-Site', /sec-fetch-site/.test(index) && /拒绝跨站请求/.test(index))
+  check('the Host must be a loopback authority', /isLoopbackAuthority\(host\)/.test(index) && /不是回环地址/.test(index))
+  check('the loopback allowlist is exact, not a prefix match',
+    /bare === '127\.0\.0\.1' \|\| bare === 'localhost' \|\| bare === '::1'/.test(index))
+  check('a mismatched Origin is still refused', /Origin 与 Host 不一致/.test(index))
   check('the body is size-bounded', /maxBytes = 65536/.test(index))
+}
+
+console.log('\nE2 — no absolute path leaves the Host')
+{
+  // The response bodies must not carry this machine's layout. `cwd` is the one
+  // deliberate exception: the dialog shows the project a person recognises.
+  const bodies = index.slice(index.indexOf("path: `${ROUTE}/diagnostic`"))
+  check('the diagnostic route does not echo rows', !/firstRow/.test(bodies))
+  check('the diagnostic route does not dump a stack trace', !/error\?\.stack/.test(index))
+  check('the archived route does not publish the sessions root', !/sessionsRoot: join/.test(index))
+  check('the preview route does not publish the session directory', !/directory: plan\.dir/.test(index))
+  check('no refusal embeds a directory path', !/（\$\{plan\.dir\}）/.test(index))
+  check('the tool outcome carries no path', !/dir: typeof result\.dir/.test(index) && !/dir: plan\.dir,/.test(index))
 }
 
 console.log('\nF — the browser half')

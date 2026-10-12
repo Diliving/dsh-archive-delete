@@ -40,7 +40,7 @@
 // only archived sessions are deletable.
 
 import { existsSync } from 'node:fs'
-import { open, readdir, rmdir, rm, stat, unlink } from 'node:fs/promises'
+import { lstat, open, readdir, rmdir, rm, stat, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { constants as zlibConstants, zstdDecompressSync } from 'node:zlib'
@@ -70,7 +70,7 @@ const DEFAULT_LIST_LIMIT = 500
  * route so a verification step can tell the two apart instead of reading stale
  * behaviour as a defect.
  */
-const MODULE_GENERATION = 8
+const MODULE_GENERATION = 9
 
 /**
  * Host services, published by {@link apply} once the inject form has resolved
@@ -289,6 +289,11 @@ function projectionCachePath(dshRoot, id) {
  * be decoded, and a log whose header is unreadable must still be findable.
  * Deleting "the conversation" but leaving its log behind is the one outcome
  * worth avoiding, and the scan reads directory entries only.
+ *
+ * The leaf must be a REAL directory. `lstat` reports a junction or a symlink as a
+ * link, and such a leaf is not a session directory: `rm` would only unlink it, so
+ * treating it as one buys nothing and would make this plugin a way to remove a
+ * link somebody else planted.
  * @param root - the persistence root (`<DSH_HOME>/sessions`).
  * @param id - session id.
  * @returns the absolute session directory, or `undefined` when absent.
@@ -304,13 +309,56 @@ async function locateSessionDir(root, id) {
   for (const project of projects) {
     if (!project.isDirectory()) continue
     const candidate = join(root, project.name, segment)
-    if (existsSync(candidate)) return candidate
+    const info = await lstat(candidate).catch(() => undefined)
+    if (info !== undefined && info.isDirectory() && !info.isSymbolicLink()) return candidate
   }
   return undefined
 }
 
 /**
+ * Re-check one planned leaf immediately before it is removed.
+ *
+ * Everything this inspects was already inspected while the plan was built, and
+ * the point is that time has passed since: the leaf can have been swapped, the
+ * log can have been replaced, and the filesystem can answer differently.
+ * @param dir - the planned session directory (absolute).
+ * @param id - the session id the caller asked for.
+ * @returns a refusal reason, or `undefined` when the leaf is still the session.
+ */
+async function validateLeaf(dir, id) {
+  const info = await lstat(dir).catch(() => undefined)
+  if (info === undefined) return '会话目录在删除前消失，已中止'
+  if (info.isSymbolicLink()) return '会话目录是符号链接/junction，拒绝删除'
+  if (!info.isDirectory()) return '会话目录不是一个真实目录，拒绝删除'
+  // The log's own header is the authoritative statement of which session lives
+  // here, so the removal is aimed by identity rather than by path alone.
+  let log
+  try {
+    log = (await readdir(dir)).filter((name) => /^session(\.[a-z0-9]+)?\.jsonl(\.zstd)?$/.test(name))
+  } catch {
+    log = []
+  }
+  if (log.length === 0) {
+    // Nothing to identify: an empty directory under this name is not a session
+    // this plugin can vouch for, but it is also not identifiable as one. Refuse
+    // rather than guess.
+    return '会话目录里没有可识别的会话日志，拒绝删除'
+  }
+  for (const name of log) {
+    const header = await readLogHeader(join(dir, name))
+    if (header === undefined) continue
+    if (String(header.id) !== id) return '会话目录里的日志属于另一个会话，拒绝删除'
+    return undefined
+  }
+  return '会话目录里的日志无法解读，拒绝删除'
+}
+
+/**
  * Every file a session directory holds, recursively.
+ *
+ * A symlinked subdirectory is listed as a FILE rather than followed: the count is
+ * a size estimate for a confirmation dialog, and descending into a link would
+ * both misreport and read somewhere the session does not own.
  * @param dir - the session directory.
  * @returns absolute file paths, best effort.
  */
@@ -325,7 +373,7 @@ async function listSessionFiles(dir) {
     }
     for (const entry of entries) {
       const path = join(current, entry.name)
-      if (entry.isDirectory()) await walk(path)
+      if (entry.isDirectory() && !entry.isSymbolicLink()) await walk(path)
       else found.push(path)
     }
   }
@@ -531,8 +579,34 @@ async function deleteSessionArtifacts(ctx, id, options = {}) {
   if (typeof id !== 'string' || id === '') {
     return { id: String(id), deleted: false, reason: '会话 id 必须是字符串' }
   }
+  // Two callers can aim at one id at once — the sidebar and the Agent tool, or two
+  // HTTP posts. Every step below is idempotent, so the damage is nil, but both
+  // calls would claim `deleted: true` and neither report could tell "I removed it"
+  // from "someone else already had". The second caller is told so instead.
+  if (IN_FLIGHT.has(id)) {
+    return { id, deleted: false, reason: '同一个会话已有一次删除正在进行' }
+  }
+  IN_FLIGHT.add(id)
+  try {
+    return await removeSessionArtifacts(ctx, id, options)
+  } finally {
+    IN_FLIGHT.delete(id)
+  }
+}
+
+/**
+ * The deletion itself, serialized per id by {@link deleteSessionArtifacts}.
+ * @param ctx - Host plugin context.
+ * @param id - session id.
+ * @param options - `force` skips the archive gate (the Agent tool's opt-in).
+ * @returns the outcome record.
+ */
+async function removeSessionArtifacts(ctx, id, options) {
   const plan = await planDeletion(ctx, id)
 
+  // The refusal order is deliberate and is asserted by the suite: the archive gate
+  // answers first, because it is the only gate that fails closed for a session the
+  // user did not explicitly hand over.
   if (!plan.archived && options.force !== true) {
     return {
       id,
@@ -549,9 +623,11 @@ async function deleteSessionArtifacts(ctx, id, options = {}) {
     return {
       id,
       deleted: false,
+      // The refusal names the id, never the absolute path: a reason travels to the
+      // browser and to the model, and neither needs this machine's layout.
       reason: plan.lockFile
-        ? `会话目录里存在 session.lock（${plan.dir}），可能仍有写入方，拒绝删除`
-        : `会话目录不可写（${plan.dir}），无法确认没有写入方，拒绝删除`,
+        ? '会话目录里存在 session.lock，可能仍有写入方，拒绝删除'
+        : '会话目录不可写，无法确认没有写入方，拒绝删除',
     }
   }
   if (plan.dir === undefined && !plan.cachePresent && !plan.archived) {
@@ -567,6 +643,26 @@ async function deleteSessionArtifacts(ctx, id, options = {}) {
   let freedBytes = 0
 
   if (plan.dir !== undefined) {
+    // Re-validate immediately before the destructive call, because everything the
+    // plan decided was decided earlier:
+    //
+    //   * the leaf must still be a REAL directory. `lstat` sees a junction or a
+    //     symlink as a link, and such a leaf is skipped rather than removed — the
+    //     plugin must not be a way to unlink a link somebody else planted, and it
+    //     must never treat a reparse point as a session directory.
+    //   * the session must not have become live in this process meanwhile, which
+    //     matters most on the `force` path: that path skips the archive gate, so the
+    //     liveness snapshot taken in `planDeletion` would otherwise be the only
+    //     thing standing between a resumable session and its log.
+    //   * the log header must still name this id, so a directory that appeared
+    //     under this name between the plan and now is refused rather than deleted.
+    const guard = await validateLeaf(plan.dir, id)
+    if (guard !== undefined) {
+      return { id, deleted: false, reason: guard }
+    }
+    if (liveSet().has(id)) {
+      return { id, deleted: false, reason: '会话在删除前变为活动状态，已中止' }
+    }
     try {
       await rm(plan.dir, { recursive: true, force: true })
       removedFiles = plan.files.length
@@ -624,7 +720,6 @@ async function deleteSessionArtifacts(ctx, id, options = {}) {
     // clearing an archived id's bookkeeping is a completed deletion even when
     // there were never any files to remove.
     deleted: plan.dir === undefined || !existsSync(plan.dir),
-    dir: plan.dir,
     removedFiles,
     freedBytes,
     cache: cache.how,
@@ -671,7 +766,6 @@ function outcomeJson(result) {
   return {
     id: result.id,
     deleted: result.deleted === true,
-    dir: typeof result.dir === 'string' ? result.dir : null,
     removedFiles: result.removedFiles ?? 0,
     freedBytes: result.freedBytes ?? 0,
     cache: result.cache ?? 'skipped',
@@ -728,34 +822,66 @@ async function readJsonBody(req, maxBytes = 65536) {
 /**
  * Whether a request may act.
  *
- * These routes mutate the user's disk, so the one attack that matters is a
- * cross-origin page reaching the loopback server. Browsers attach `Origin` to
- * every cross-origin request AND to every same-origin non-GET fetch, so a
- * present `Origin` must equal the request's own authority. A request with no
- * `Origin` at all is a non-browser client (curl, a script) and is allowed: it
- * already had to reach loopback, the same trust boundary the rest of the local
- * web surface uses. A JSON content type is additionally required on writes,
- * which forces a CORS preflight that these routes never answer.
+ * These routes mutate the user's disk, so the attack that matters is a web page
+ * reaching the loopback server. Three checks, and it is worth being precise about
+ * what each one does and does not buy:
+ *
+ *  1. **`Sec-Fetch-Site`** — a browser sets this itself and page script cannot
+ *     forge it, so `cross-site` is a definitive refusal. This is the check that
+ *     actually stops a hostile page, including one that is served from an
+ *     attacker's domain that resolves to loopback.
+ *  2. **Host must be a loopback authority.** Comparing `Origin` to `Host` alone
+ *     proves only that the two agree — under DNS rebinding both read
+ *     `evil.example:19387` and the comparison passes. Restricting `Host` to
+ *     loopback pins the request to the interface these routes are actually for.
+ *  3. **`Origin`, when present, must equal `Host`.** Redundant with (1) for
+ *     browsers, and useful for everything else.
+ *
+ * A request with no `Origin` and no `Sec-Fetch-Site` is a non-browser client
+ * (curl, a script). It is allowed: it already had to reach loopback. That is a
+ * deliberate choice, and it is the reason this plugin's routes must stay behind a
+ * loopback bind — see the README's note on `webServer.host`.
  * @param req - the incoming request.
  * @param requireJson - whether the JSON content type is required.
  * @returns `undefined` when allowed, otherwise the refusal.
  */
 function checkOrigin(req, requireJson) {
+  const site = req.headers['sec-fetch-site']
+  if (typeof site === 'string' && site !== '' && site !== 'same-origin' && site !== 'none') {
+    return `Sec-Fetch-Site: ${site}，拒绝跨站请求`
+  }
+  const host = String(req.headers.host ?? '')
+  if (!isLoopbackAuthority(host)) return `Host ${host === '' ? '(缺失)' : host} 不是回环地址，拒绝请求`
   const origin = req.headers.origin
   if (typeof origin === 'string' && origin !== '') {
-    let host
+    let originHost
     try {
-      host = new URL(origin).host
+      originHost = new URL(origin).host
     } catch {
       return 'Origin 头无法解析'
     }
-    if (host !== req.headers.host) return 'Origin 与 Host 不一致，拒绝跨站请求'
+    if (originHost !== host) return 'Origin 与 Host 不一致，拒绝跨站请求'
   }
   if (requireJson) {
     const type = String(req.headers['content-type'] ?? '')
     if (!type.toLowerCase().startsWith('application/json')) return '写操作要求 content-type: application/json'
   }
   return undefined
+}
+
+/**
+ * Whether a `Host` header names a loopback authority (`127.0.0.1:port`,
+ * `localhost:port`, `[::1]:port`, with or without the port).
+ * @param host - the raw `Host` header value.
+ * @returns whether it is loopback.
+ */
+function isLoopbackAuthority(host) {
+  if (host === '') return false
+  const name = host.startsWith('[')
+    ? host.slice(0, host.indexOf(']') + 1)
+    : host.split(':')[0]
+  const bare = name.startsWith('[') ? name.slice(1, -1) : name
+  return bare === '127.0.0.1' || bare === 'localhost' || bare === '::1' || bare === '0000:0000:0000:0000:0000:0000:0000:0001'
 }
 
 /**
@@ -811,14 +937,16 @@ export function apply(ctx, config) {
             return
           }
           const listing = await listArchived(ctx, DEFAULT_LIST_LIMIT)
+          // `sessionsRoot` is deliberately absent: the client never needed it, and
+          // a route that hands out this machine's layout to anything that can
+          // reach loopback is a disclosure with no upside.
           sendJson(res, 200, {
             ...listing,
             menuEnabled: currentSettings(config).menuEnabled,
-            sessionsRoot: join(dshHome(), 'sessions'),
           })
         })().catch((error) => {
           ctx.logger?.error?.(`${PLUGIN_ID}: archived route failed`, error)
-          if (!res.headersSent) sendJson(res, 500, { error: String(error?.message ?? error) })
+          if (!res.headersSent) sendJson(res, 500, { error: 'internal' })
           else res.end()
         })
       },
@@ -829,11 +957,11 @@ export function apply(ctx, config) {
       path: `${ROUTE}/diagnostic`,
       handler: (req, res) => {
         void (async () => {
-          // Counts and identities only — never a session id, never a path. This
-          // route is the one exception to the origin guard (it carries nothing a
-          // caller could act on), and that exemption is only honest while it
-          // stays contentless: the moment it echoes a row it becomes a
-          // read-an-anything endpoint for any page on this machine.
+          // Counts and codes only — never a session id, never a path, and no
+          // stack trace either: an absolute path in an error message is the same
+          // disclosure as an absolute path in a field. This route carries the one
+          // exception to the origin guard because it has nothing a caller could
+          // act on, and that exemption is only honest while it stays contentless.
           const steps = {
             moduleGeneration: MODULE_GENERATION,
             sessionsResolved: ready(sessionsHandle),
@@ -843,8 +971,9 @@ export function apply(ctx, config) {
           const attempt = async (label, run) => {
             try {
               steps[label] = await run()
-            } catch (error) {
-              steps[label] = `THREW: ${String(error?.message ?? error)}`
+            } catch {
+              // The failure class, without its message: a message can embed a path.
+              steps[label] = 'THREW'
             }
           }
           await attempt('archivedCount', () => archivedSet().size)
@@ -860,7 +989,8 @@ export function apply(ctx, config) {
           await attempt('menuEnabled', () => currentSettings(config).menuEnabled)
           sendJson(res, 200, { steps })
         })().catch((error) => {
-          if (!res.headersSent) sendJson(res, 500, { error: String(error?.stack ?? error) })
+          ctx.logger?.error?.(`${PLUGIN_ID}: diagnostic route failed`, error)
+          if (!res.headersSent) sendJson(res, 500, { error: 'internal' })
           else res.end()
         })
       },
@@ -883,20 +1013,21 @@ export function apply(ctx, config) {
             return
           }
           const plan = await planDeletion(ctx, id)
-          const logs = plan.files.filter((path) => path.endsWith('.jsonl') || path.endsWith('.jsonl.zstd'))
+          // Only what the confirmation dialog renders. The session's own directory
+          // path and its log file names are deliberately NOT returned: the client
+          // does not display them, and a route anybody on loopback can call should
+          // not hand out this machine's layout. `cwd` stays because the dialog shows
+          // the project a person recognises, which is the whole point of that row.
           sendJson(res, 200, {
             id,
             archived: plan.archived,
             live: plan.live,
             lockFile: plan.lockFile,
             writable: plan.writable,
-            directory: plan.dir ?? null,
-            logFiles: logs.map((path) => path.slice(path.lastIndexOf(sep) + 1)),
             fileCount: plan.files.length,
             bytes: plan.bytes + (plan.cachePresent ? plan.cacheBytes : 0),
             createdAt: plan.createdAt ?? null,
             cwd: plan.cwd ?? null,
-            errors: plan.errors ?? [],
           })
         })().catch((error) => {
           ctx.logger?.error?.(`${PLUGIN_ID}: preview route failed`, error)
@@ -1018,7 +1149,6 @@ export function apply(ctx, config) {
                   id: { type: 'string' },
                   deleted: { type: 'boolean' },
                   reason: { oneOf: [{ type: 'string' }, { type: 'null' }] },
-                  dir: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                   cache: { type: 'string' },
                   // The number of workspace records actually detached, or one of
                   // the 'skipped'/'failed' markers — hence a union, not a string.
@@ -1100,3 +1230,6 @@ export {
   deleteSessionArtifacts,
   setHostServices,
 }
+
+/** Session ids with a deletion in progress, so two callers cannot both report success. */
+const IN_FLIGHT = new Set()

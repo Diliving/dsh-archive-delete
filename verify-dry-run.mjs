@@ -266,11 +266,45 @@ function findUndefined(value, path = '', seen = new Set()) {
 }
 
 /** The keywords the kernel's enforced JSON Schema subset accepts. */
-const SUBSET_KEYWORDS = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const', 'description', 'title', 'default', 'examples'])
+const SUBSET_KEYWORDS = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const', 'description', 'title', 'default', 'examples', 'deprecated'])
 const SIBLING_OF_ONE_OF = ['properties', 'required', 'additionalProperties', 'items', 'enum', 'const']
+/** The kernel's CONSTRAINT_KEYWORDS, verbatim from `dsh-tools`. */
+const KERNEL_CONSTRAINT_KEYWORDS = ['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const']
+/** The kernel's ANNOTATION_KEYWORDS, verbatim. Their VALUE must be lossless JSON. */
+const KERNEL_ANNOTATION_KEYWORDS = ['description', 'title', 'default', 'examples', 'deprecated']
 
 /**
- * Check a schema is inside the kernel's subset, mirroring `assertSupportedJsonSchema`.
+ * Whether a value is lossless JSON, mirroring `walkJsonValue`: plain objects and
+ * arrays only, finite numbers only, and no `undefined` anywhere in the graph.
+ * @param value - the candidate.
+ * @returns whether it would survive a JSON round trip.
+ */
+function isLosslessJson(value, seen = new Set()) {
+  if (value === null) return true
+  const kind = typeof value
+  if (kind === 'string' || kind === 'boolean') return true
+  if (kind === 'number') return Number.isFinite(value)
+  if (kind !== 'object') return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index) || !isLosslessJson(value[index], seen)) return false
+    }
+    return true
+  }
+  for (const key of Object.keys(value)) {
+    if (!isLosslessJson(value[key], seen)) return false
+  }
+  return true
+}
+
+/**
+ * Check a schema is inside the kernel's subset, mirroring `assertSupportedJsonSchema`
+ * including the rule the first version of this harness missed: an ANNOTATION
+ * keyword's value must itself be lossless JSON, because the kernel snapshots the
+ * schema before projecting it. `{ description: () => {} }` is accepted by a
+ * keyword-only check and throws in the kernel.
  * @param schema - the schema to walk.
  * @returns violation strings, empty when the schema would be accepted.
  */
@@ -279,6 +313,9 @@ function checkSchemaSubset(schema, path = 'schema', violations = [], seen = new 
   seen.add(schema)
   for (const key of Object.keys(schema)) {
     if (!SUBSET_KEYWORDS.has(key)) violations.push(`${path}.${key} is not in the enforced subset`)
+    else if (KERNEL_ANNOTATION_KEYWORDS.includes(key) && !isLosslessJson(schema[key])) {
+      violations.push(`${path}.${key} is an annotation whose value is not lossless JSON`)
+    }
   }
   if (Object.hasOwn(schema, 'oneOf')) {
     if (Object.hasOwn(schema, 'type')) violations.push(`${path} cannot declare both type and oneOf`)
@@ -452,6 +489,86 @@ console.log('\ncase 4b — the project shell goes only when its last session doe
   check('the shell survives its first deletion', existsSync(soloDir))
   await plugin.deleteSessionArtifacts(ctx, SOLO_B)
   check('the shell goes with its last session', !existsSync(soloDir))
+}
+
+// ── case 4c: the refusal ORDER, proven instead of grepped ───────────────────
+//
+// The security suite's "the archive gate answers first" used to be an
+// `indexOf(...) > 0` substring check: it stayed green with the gate moved below
+// every other refusal. This case makes the order observable instead — the
+// fixture satisfies FOUR refusal conditions at once (unarchived, live,
+// lock-bearing, unwritable), so exactly one gate can produce the answer and
+// swapping any two of them changes it.
+
+console.log('\ncase 4c — the refusal order, proven by a fixture that trips every gate')
+{
+  const MANY = 'session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const manyDir = await writeSessionDir(MANY)
+  await writeFile(join(manyDir, 'session.lock'), '')
+  const ctx = makeContext({ archived: [], live: [MANY] })
+  const result = await plugin.deleteSessionArtifacts(ctx, MANY)
+  check('the refusal is the ARCHIVE gate, not liveness or the lock', String(result.reason).includes('归档'), result.reason)
+  check('nothing was removed', existsSync(manyDir) && !existsSync(join(manyDir, 'session.lock')) === false)
+
+  // Removing one condition at a time walks the order: each step must fall through
+  // to the next gate rather than skipping it.
+  const liveCtx = makeContext({ archived: [MANY], live: [MANY] })
+  const liveResult = await plugin.deleteSessionArtifacts(liveCtx, MANY)
+  check('archived + live is refused by the LIVENESS gate', String(liveResult.reason).includes('活动'), liveResult.reason)
+
+  const lockCtx = makeContext({ archived: [MANY], live: [] })
+  const lockResult = await plugin.deleteSessionArtifacts(lockCtx, MANY)
+  check('archived + lock is refused by the LOCK gate', String(lockResult.reason).includes('session.lock'), lockResult.reason)
+
+  await rm(join(manyDir, 'session.lock'), { force: true })
+  const okCtx = makeContext({ archived: [MANY], live: [] })
+  const okResult = await plugin.deleteSessionArtifacts(okCtx, MANY)
+  check('with every condition cleared it actually deletes', okResult.deleted === true, JSON.stringify(okResult))
+}
+
+// ── case 4d: a leaf that is not a real session directory ────────────────────
+
+console.log('\ncase 4d — the leaf is re-validated immediately before removal')
+{
+  // A directory under the session id whose log names a DIFFERENT session: the
+  // removal is aimed by identity, so this must be refused rather than deleted.
+  const MISLABELLED = 'session-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  const wrongDir = join(HOME, 'sessions', plugin.projectKey(CWD), plugin.encodeSegment(MISLABELLED))
+  await mkdir(wrongDir, { recursive: true })
+  const otherHeader = JSON.stringify({ type: 'session', version: 4, id: ACTIVE, cwd: CWD, isSeeded: false, delegationDepth: 0 })
+  await writeFile(join(wrongDir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(`${otherHeader}\n`)))
+  const ctx = makeContext({ archived: [MISLABELLED], live: [] })
+  const result = await plugin.deleteSessionArtifacts(ctx, MISLABELLED)
+  check('a directory whose log names another session is refused', result.deleted === false, JSON.stringify(result))
+  check('that directory survives', existsSync(wrongDir))
+
+  // A directory with no recognizable log at all: nothing identifies it as the
+  // session, so it is refused too.
+  const EMPTYISH = 'session-cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+  const blankDir = join(HOME, 'sessions', plugin.projectKey(CWD), plugin.encodeSegment(EMPTYISH))
+  await mkdir(blankDir, { recursive: true })
+  await writeFile(join(blankDir, 'unrelated.txt'), 'not a session log')
+  const blankCtx = makeContext({ archived: [EMPTYISH], live: [] })
+  const blankResult = await plugin.deleteSessionArtifacts(blankCtx, EMPTYISH)
+  check('a directory with no session log is refused', blankResult.deleted === false, JSON.stringify(blankResult))
+  check('that directory survives', existsSync(blankDir))
+}
+
+// ── case 4e: two callers, one id ────────────────────────────────────────────
+
+console.log('\ncase 4e — a concurrent duplicate delete does not report a second success')
+{
+  const RACE = 'session-dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  await writeSessionDir(RACE)
+  const ctx = makeContext({ archived: [RACE], live: [] })
+  const [first, second] = await Promise.all([
+    plugin.deleteSessionArtifacts(ctx, RACE),
+    plugin.deleteSessionArtifacts(ctx, RACE),
+  ])
+  const winners = [first, second].filter((result) => result.deleted === true).length
+  const refused = [first, second].filter((result) => String(result.reason ?? '').includes('正在进行')).length
+  check('exactly one caller reports the deletion', winners === 1, JSON.stringify([first, second]))
+  check('the other is told a deletion is in flight', refused === 1, JSON.stringify([first, second]))
 }
 
 // ── case 5: the preflight preview reports exactly what deletion removes ─────
@@ -673,7 +790,11 @@ console.log('\ncase 9 — the Agent tool answers with lossless JSON, ghosts incl
   checkEqual('no undefined survives in the delete result', deleteViolations, [])
   checkEqual('the delete result satisfies its own declared schema', validateAgainstSchema(tool.output.schema, deletion), [])
   check('the ghost-free session was deleted', deletion.results[0].deleted === true, JSON.stringify(deletion))
-  check('a missing artifact path is an explicit null', deletion.results[0].dir === null || typeof deletion.results[0].dir === 'string', JSON.stringify(deletion.results[0]))
+  // No absolute path may leave the Host in a tool result: the model does not need
+  // this machine's layout, and the field is simply not part of the outcome.
+  check('no absolute path is echoed in the delete result',
+    !JSON.stringify(deletion).includes(HOME) && !Object.hasOwn(deletion.results[0], 'dir'),
+    JSON.stringify(deletion.results[0]))
 
   // A refusal is the other shape the tool returns, and it must be JSON-safe too.
   const refused = await tool.execute({ action: 'delete', ids: [ALREADY_GONE], confirm: true })
@@ -682,13 +803,30 @@ console.log('\ncase 9 — the Agent tool answers with lossless JSON, ghosts incl
   check('the archived-but-empty id is cleared rather than refused', refused.results[0].deleted === true, JSON.stringify(refused))
 
   // And the validator itself must be able to fail, or none of the above proves
-  // anything: a deliberately dishonest schema is rejected on a conforming value.
+  // anything. A negative control per axis: a schema the kernel declares INVALID,
+  // and values the kernel declares NON-CONFORMING.
   check('a dishonest schema is detected',
     validateAgainstSchema({ type: 'object', required: ['createdAt'], properties: { createdAt: { type: 'integer' } } }, { createdAt: null }).length === 1,
     'the harness validator must reject null where an integer is declared')
-  check('an out-of-subset schema is detected',
+  check('an out-of-subset keyword is detected',
     checkSchemaSubset({ type: 'object', properties: { a: { anyOf: [{ type: 'string' }] } } }).length > 0,
     'the harness checker must reject keywords outside the kernel subset')
+  check('an annotation with a non-lossless value is detected',
+    checkSchemaSubset({ type: 'object', description: () => {} }).length > 0,
+    'the kernel snapshots the schema, so a function-valued annotation must be rejected')
+  check('a missing required property is detected',
+    validateAgainstSchema({ type: 'object', required: ['a'], properties: { a: { type: 'integer' } } }, {}).length === 1,
+    'an absent required property must be reported')
+  check('a wrong scalar type is detected',
+    validateAgainstSchema({ type: 'object', properties: { a: { type: 'string' } } }, { a: 7 }).length === 1,
+    'a number where a string is declared must be reported')
+  check('an under-discriminating oneOf is detected',
+    validateAgainstSchema({ oneOf: [{ type: 'string' }, { type: 'string' }] }, 'x').length === 1,
+    'oneOf requires exactly one match, not at least one')
+  check('the keyword lists match the kernel verbatim',
+    KERNEL_CONSTRAINT_KEYWORDS.every((keyword) => SUBSET_KEYWORDS.has(keyword))
+    && KERNEL_ANNOTATION_KEYWORDS.every((keyword) => SUBSET_KEYWORDS.has(keyword)),
+    'every kernel keyword must be in the harness subset')
 
   check('the tool rendered a text result', typeof tool.output.render === 'function'
     && Array.isArray(tool.output.render({ action: 'list' }, listing)), 'render must return content blocks')

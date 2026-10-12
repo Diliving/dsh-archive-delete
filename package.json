@@ -28,14 +28,16 @@
     "cordis.patch.yml",
     "verify-dry-run.mjs",
     "verify-client.mjs",
+    "verify-security.mjs",
     "README.md",
     "MANUAL.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node verify-dry-run.mjs && node verify-client.mjs",
+    "test": "node verify-dry-run.mjs && node verify-client.mjs && node verify-security.mjs",
     "test:host": "node verify-dry-run.mjs",
-    "test:client": "node verify-client.mjs"
+    "test:client": "node verify-client.mjs",
+    "test:security": "node verify-security.mjs"
   },
   "meta": {
     "title": "已归档会话删除",

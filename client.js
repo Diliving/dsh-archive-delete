@@ -59,6 +59,7 @@ window.__ModuleLoader__.load({
     }
 
     /** This plugin's Host routes. */
+    const API_ARCHIVED = '/plugins/dsh-archive-delete/archived'
     const API_PREVIEW = '/plugins/dsh-archive-delete/preview'
     const API_DELETE = '/plugins/dsh-archive-delete/delete'
 
@@ -389,6 +390,25 @@ window.__ModuleLoader__.load({
       const { sessionId, useWorkspaces, useMenuOpenState, t } = props
       const [, setMenuOpen] = useMenuOpenState()
       const [state, setState] = React.useState('idle')
+      // `menuEnabled` is a real switch, so the row has to consult it. It is read
+      // from the Host once per mount: the request itself is what a row click
+      // already costs, and the answer changes only when a person edits settings.
+      const [enabled, setEnabled] = React.useState(null)
+      React.useEffect(() => {
+        let live = true
+        void fetch(API_ARCHIVED, { credentials: 'same-origin' })
+          .then((response) => (response.ok ? response.json() : undefined))
+          .then((body) => {
+            // Fail OPEN on an unreadable answer: the switch's purpose is "hide the
+            // row", and a broken probe must not present itself as the user having
+            // turned it off.
+            if (live && body !== undefined && body !== null) setEnabled(body.menuEnabled !== false)
+          })
+          .catch(() => {})
+        return () => {
+          live = false
+        }
+      }, [])
 
       const archived = useWorkspaces((store) => {
         const ids = store === null || store === undefined ? undefined : store.archivedSessionIds
@@ -412,6 +432,7 @@ window.__ModuleLoader__.load({
       // Hooks run before either return, so the row's hook order is identical for
       // every session — archived or not.
       if (archived !== true) return null
+      if (enabled === false) return null
 
       return h('button', {
         type: 'button',

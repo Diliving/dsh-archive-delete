@@ -81,25 +81,36 @@ await ctx.workspaceRegistry.unarchiveSession(id)  // 清掉归档条目
 
 ## 安全门禁
 
-删除请求要通过**全部**检查才会真正落盘：
+删除请求按**固定顺序**通过检查，第一道不过就停在那里：
 
-| 门禁 | 拒绝原因 |
-|---|---|
-| 会话在 `archivedSessionIds` 里 | “会话未归档；本插件默认只删除已归档的会话” |
-| 会话不在本进程存活集合里 | “会话仍在本进程中活动，拒绝删除” |
-| 会话目录里没有 `session.lock`，且目录可写 | “可能仍有写入方，拒绝删除” |
-| 至少存在一份产物 | “没有找到该会话的任何磁盘产物” |
+| 顺序 | 门禁 | 拒绝原因 | 备注 |
+|---|---|---|---|
+| 1 | 会话在 `archivedSessionIds` 里 | “会话未归档；本插件默认只删除已归档的会话” | 唯一对“用户没交出来的会话”失败的闭门 |
+| 2 | 会话不在本进程存活集合里 | “会话仍在本进程中活动，拒绝删除” | 只覆盖**本进程**，见下方限制 |
+| 3 | 会话目录可写、且没有 `session.lock` | “可能仍有写入方，拒绝删除” | Windows 上 `session.lock` 永不出现，见下方限制 |
+| 4 | 至少存在一份产物（或该 id 已归档的记账） | “没有找到该会话的任何磁盘产物” | 已归档 + 磁盘空 = 清理记账，视为成功 |
+| 5 | **删除前重新校验**：叶子仍是真实目录（非链接）、存活集合仍未包含它、日志头里的 id 与请求一致 | “会话目录是符号链接/junction”“会话在删除前变为活动状态”“日志属于另一个会话” | 第 1–4 道都是在更早的时刻做的判断，这一道是临门一脚 |
+| — | 同一 id 已有删除在进行 | “同一个会话已有一次删除正在进行” | 两个调用方同时删不会都报成功 |
 
-「已归档」之所以是关键门禁：归档是**持久**的，并且 `agent/pre-step` 门禁会读这个集合，所以已归档会话无法被唤醒，也就不可能在我们删它的同时还有人往里写。
+「已归档」是第一道也是关键的一道：归档是**持久**的，且 `agent/pre-step` 门禁会读这个集合，所以已归档会话无法被唤醒。
 
 Agent 工具默认**也**受这条约束；只有部署方把设置项 `allowAgentDeleteActive` 打开，模型才有权删未归档会话（还需要它显式传 `forceActive`）。
 
+### 这套门禁做不到什么（据实说明）
+
+- **只覆盖本进程的存活集合。** `liveSet()` 读的是本进程的会话注册表，所以**第二个 DSH 实例**正在使用的会话，在本进程看来“不活跃”。多实例部署下这不是可靠的活跃检测。
+- **Windows 上没有 `session.lock` 可查。** JSONL 后端在 Windows 用的是**命名内核信号量**，不在会话目录里落文件；所以第 3 道门禁在 Windows 上的实际内容只剩“目录可写”。它对 POSIX 才有原本的含义。
+- **不判断附件。** 见下文“已知边界”。
+
 ### 写入接口的额外防护
 
-- 只绑定在本机回环地址上（DSH 自己的 web 服务）。
-- 带 `Origin` 的请求，其 host 必须与 `Host` 头一致；不一致直接 403（挡跨站页面）。
-- 写操作必须 `content-type: application/json`（强制 CORS 预检，而路由不回应预检）。
+- 只接受**回环地址**的 `Host`（`127.0.0.1` / `localhost` / `[::1]`，允许带端口）——不是回环一律拒绝。这条是必需的：DSH 自己的 web 服务默认绑回环，但配置允许改成 `0.0.0.0`；一旦改掉，任何人都能列举并删除你的已归档会话。
+- 带 `Sec-Fetch-Site` 且不是 `same-origin`/`none` 的请求直接拒绝（浏览器自己写这个头，页面脚本改不了）。
+- 带 `Origin` 的请求，其 host 必须与 `Host` 一致。
+- 写操作必须 `content-type: application/json`。
 - 请求体上限 64 KiB。
+
+> **关于 DNS rebinding，说清楚界限。** 只比较 `Origin` 与 `Host` **挡不住** rebinding：恶意页面若从 `evil.example:19387` 提供，而该域名解析到 `127.0.0.1`，浏览器视为同源，两个头都是 `evil.example:19387`，比较会通过。真正拦住它的是 `Sec-Fetch-Site`（页面无法伪造）和上文的回环 `Host` 白名单。**不带任何 `Origin`/`Sec-Fetch-Site` 的非浏览器客户端（curl、脚本）是被放行的**——它本来就已经能访问回环，这是刻意的取舍，也是这些路由必须留在回环绑定之后的原因。
 
 ---
 
@@ -148,10 +159,18 @@ action="delete", ids=[...], confirm=true, forceActive=true   # 仅当部署方�
 | 插件源码 | 克隆下来的仓库目录 |
 | profile 链接 | `$DSH_HOME/profiles/<profile>/node_modules/dsh-archive-delete`（`link:` 依赖） |
 | bundle 声明 | profile `package.json` 的 `dsh.profile.bundles` 里 `dsh-archive-delete` |
-| 离线测试（Host 半） | `node verify-dry-run.mjs`（71 项） |
+| 离线测试（Host 半） | `node verify-dry-run.mjs`（104 项） |
 | 离线测试（客户端半） | `node verify-client.mjs`（45 项） |
+| 安全自检 | `node verify-security.mjs`（45 项） |
+| 全部 | `npm test` |
 
-两套测试都完全离线，不碰真实数据：Host 侧在合成的临时 `DSH_HOME` 上跑真实的删除路径（含工作区记账清理）；客户端侧用假的 `window.__ModuleLoader__` 加载**真实的 `client.js`**，点击菜单行并驱动对话框的取消、确认、失败三条路径。
+三套都完全离线，不碰真实数据：
+
+- **Host 半**在合成的临时 `DSH_HOME` 上跑真实的删除路径（门禁顺序、记账清理、叶子重校验、并发去重、工具输出的 JSON 契约）。
+- **客户端半**用假的 `window.__ModuleLoader__` 加载**真实的 `client.js`**，点击菜单行并驱动对话框的取消、确认、失败三条路径。
+- **安全自检**把本文档的安全声明变成可复跑断言：无 `eval`/`child_process`、只读文件系统面、路径封闭、回环 `Host` 白名单与 `Sec-Fetch-Site`、响应体不含绝对路径、测试套件在导入插件前钉死 `DSH_HOME`。
+
+安全自检是**声明级**检查（正则 + 结构），行为级证明在 Host 半套件里；两者互相覆盖对方的盲区——比如"门禁顺序"只在行为套件里被证明，而"没有 `eval`"只在自检里被证明。
 
 ### 依赖
 
@@ -188,7 +207,7 @@ action="delete", ids=[...], confirm=true, forceActive=true   # 仅当部署方�
 | `GET` | `/plugins/dsh-archive-delete/preview?id=<id>` | 单个会话的删除预览（确认框用它） |
 | `POST` | `/plugins/dsh-archive-delete/delete` | `{"ids":["..."]}` 执行永久删除 |
 
-除了 `diagnostic`，每条路由都带 `Origin` 校验（带了 `Origin` 就必须与 `Host` 一致，否则 403），写路由另外强制 `content-type: application/json`。`diagnostic` 之所以可以不带门禁，是因为它**不返回任何可操作的内容**——这条豁免只在它保持“无内容”时成立，所以它连一个会话 id 都不回显。
+除了 `diagnostic`，每条路由都校验 `Sec-Fetch-Site`（跨站拒绝）、`Host` 必须是回环地址、以及 `Origin` 与 `Host` 一致；写路由另外强制 `content-type: application/json` 并限制请求体 64 KiB。`diagnostic` 之所以可以不带门禁，是因为它**不返回任何可操作的内容**——这条豁免只在它保持“无内容”时成立，所以它连一个会话 id 都不回显，出错也只回 `internal`，不回堆栈。
 
 ---
 
