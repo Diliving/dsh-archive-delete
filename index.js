@@ -70,7 +70,7 @@ const DEFAULT_LIST_LIMIT = 500
  * route so a verification step can tell the two apart instead of reading stale
  * behaviour as a defect.
  */
-const MODULE_GENERATION = 7
+const MODULE_GENERATION = 8
 
 /**
  * Host services, published by {@link apply} once the inject form has resolved
@@ -829,6 +829,11 @@ export function apply(ctx, config) {
       path: `${ROUTE}/diagnostic`,
       handler: (req, res) => {
         void (async () => {
+          // Counts and identities only — never a session id, never a path. This
+          // route is the one exception to the origin guard (it carries nothing a
+          // caller could act on), and that exemption is only honest while it
+          // stays contentless: the moment it echoes a row it becomes a
+          // read-an-anything endpoint for any page on this machine.
           const steps = {
             moduleGeneration: MODULE_GENERATION,
             sessionsResolved: ready(sessionsHandle),
@@ -842,20 +847,17 @@ export function apply(ctx, config) {
               steps[label] = `THREW: ${String(error?.message ?? error)}`
             }
           }
-          await attempt('archivedSessionIds', () => [...archivedSet()])
-          await attempt('liveSessionIds', () => [...liveSet()])
+          await attempt('archivedCount', () => archivedSet().size)
+          await attempt('liveCount', () => liveSet().size)
           await attempt('listing', async () => {
             const listing = await listArchived(ctx, DEFAULT_LIST_LIMIT)
             return { total: listing.total, rows: listing.rows.length }
-          })
-          await attempt('firstRow', async () => {
-            const listing = await listArchived(ctx, DEFAULT_LIST_LIMIT)
-            return listing.rows[0] ?? null
           })
           await attempt('serialize', async () => {
             const listing = await listArchived(ctx, DEFAULT_LIST_LIMIT)
             return JSON.stringify(listing).length
           })
+          await attempt('menuEnabled', () => currentSettings(config).menuEnabled)
           sendJson(res, 200, { steps })
         })().catch((error) => {
           if (!res.headersSent) sendJson(res, 500, { error: String(error?.stack ?? error) })

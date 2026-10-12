@@ -183,10 +183,12 @@ action="delete", ids=[...], confirm=true, forceActive=true   # 仅当部署方�
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
+| `GET` | `/plugins/dsh-archive-delete/diagnostic` | 只返回**计数与代号**（服务是否解析、归档条数、`menuEnabled`），不含任何会话 id 或路径 |
 | `GET` | `/plugins/dsh-archive-delete/archived` | 已归档会话列表 + 占用 + `menuEnabled` |
 | `GET` | `/plugins/dsh-archive-delete/preview?id=<id>` | 单个会话的删除预览（确认框用它） |
 | `POST` | `/plugins/dsh-archive-delete/delete` | `{"ids":["..."]}` 执行永久删除 |
-| `GET` | `/plugins/dsh-archive-delete/diagnostic` | 服务解析状态与列表步骤（排查用） |
+
+除了 `diagnostic`，每条路由都带 `Origin` 校验（带了 `Origin` 就必须与 `Host` 一致，否则 403），写路由另外强制 `content-type: application/json`。`diagnostic` 之所以可以不带门禁，是因为它**不返回任何可操作的内容**——这条豁免只在它保持“无内容”时成立，所以它连一个会话 id 都不回显。
 
 ---
 
