@@ -1,0 +1,59 @@
+{
+  "name": "dsh-archive-delete",
+  "version": "0.1.0",
+  "description": "手动永久删除已归档的对话：侧边栏会话“...”菜单里的删除项 + 给 Agent 的 archive_delete 工具。DSH 本身没有会话删除接口，此插件直接维护会话日志、投影缓存与工作区记账。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "archive",
+    "delete",
+    "session"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "icon.svg",
+    "locale",
+    "cordis.patch.yml",
+    "verify-dry-run.mjs",
+    "verify-client.mjs",
+    "README.md",
+    "MANUAL.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node verify-dry-run.mjs && node verify-client.mjs",
+    "test:host": "node verify-dry-run.mjs",
+    "test:client": "node verify-client.mjs"
+  },
+  "meta": {
+    "title": "已归档会话删除",
+    "description": "在侧边栏会话菜单里永久删除已归档的对话（含日志、投影缓存与工作区记账），并给 Agent 一个 archive_delete 工具。"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

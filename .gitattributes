@@ -1,0 +1,10 @@
+# One line-ending convention for every platform: LF in the repository.
+# Windows checkouts still work — this only pins what Git stores and what a
+# checkout produces, so a contributor on macOS/Linux and one on Windows see the
+# same bytes and a diff never turns into a whole-file rewrite.
+* text=auto eol=lf
+
+# Binary-ish assets, never normalized.
+*.png binary
+*.ico binary
+*.mp4 binary

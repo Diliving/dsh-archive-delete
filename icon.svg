@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Archived conversation deletion">
+  <rect x="6" y="10" width="34" height="26" rx="4" fill="none" stroke="currentColor" stroke-width="3"/>
+  <path d="M14 36v8h14" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M10 19h26M10 26h18" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+  <g transform="translate(40 40)">
+    <circle r="17" fill="none" stroke="currentColor" stroke-width="3"/>
+    <path d="M-7-7 7 7M7-7-7 7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+  </g>
+</svg>

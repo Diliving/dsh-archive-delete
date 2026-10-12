@@ -1,0 +1,17 @@
+# dsh-archive-delete —— bundle patch（挂载声明）。
+#
+# 插入一条 Host 行。行 id 同时是三样东西的名字：
+#   1. 设置命名空间：@deepseek-ai/dsh-settings 用行 id 定位本插件的 Config 表单；
+#   2. 客户端 bundle 的路由：/plugins/<package name>/client.js；
+#   3. 用户 profile 补丁层里可以按 id 覆盖/禁用的入口。
+# 改这里就要同步改 package.json 的 name 与客户端注册用的 id。
+#
+# 这里只声明默认配置。要改设置请走 GUI：设置 → 插件 → 已归档会话删除，
+# 或者在自己的 profile 补丁层里按同一个 id 覆盖（注意：补丁会整体替换
+# 目标行的 config，所以覆盖时必须写全每个字段）。
+- insert:
+    - id: dsh-archive-delete
+      name: dsh-archive-delete
+      config:
+        menuEnabled: true
+        allowAgentDeleteActive: false

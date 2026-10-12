@@ -1,0 +1,10 @@
+# Dependencies are NOT committed: `@deepseek-ai/schemastery` is supplied by the
+# DeepSeek Harness installation (see README "依赖"). A local copy is only needed
+# to run the offline suites outside DSH.
+node_modules/
+
+# Test and tool scratch
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
