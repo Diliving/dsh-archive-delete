@@ -486,9 +486,10 @@ const PREVIEWED = 'session-44444444-4444-4444-8444-444444444444'
 
 console.log('\ncase 6 — the ported path algorithms reproduce the backend\'s own output')
 {
-  // Expected values are the backend's own, taken from a real deployment: a
-  // non-ASCII path encodes one `~XXXX` escape per code unit, and a Windows path
-  // collapses its separators into `-`.
+  // Expected values are the backend's own: a non-ASCII path encodes one `~XXXX`
+  // escape per UTF-16 code unit, and a Windows path collapses its separators
+  // into `-`. The fixtures are deliberately synthetic — this repository should
+  // not carry anybody's real project names.
   checkEqual('projectKey of a CJK path', plugin.projectKey('E:\\示例\\演示项目\\输出'), '--E-~793A~4F8B-~6F14~793A~9879~76EE-~8F93~51FA--')
   checkEqual('projectKey of a plain Windows path', plugin.projectKey(CWD), '--C-work-demo--')
   checkEqual('projectKey collapses separator runs', plugin.projectKey('C:\\\\a//b'), '--C-a-b--')
